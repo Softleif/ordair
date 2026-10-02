@@ -252,7 +252,8 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
     /// [`or_unwind`](OrUnwind::or_unwind) resumes. The inner one is your own,
     /// untouched, so a `?` keeps whatever it captured. A panic wins over an
     /// error; `consume`'s error wins over `init`'s, as it always comes from an
-    /// earlier item.
+    /// earlier item. The losing error is dropped, as a sequential loop would
+    /// never have reached its item; to see it anyway, log it in `init`.
     ///
     /// # Panics
     ///
@@ -321,9 +322,7 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
             (Err(Some(consumer)), _) => Ok(Err(consumer)),
             (Ok(()) | Err(None), Some(init)) => Ok(Err(init)),
             // Only a failed worker leaves a result unsent, and it recorded why.
-            (Err(None), None) => {
-                Err(WorkerPanic(Mutex::new(Box::new("A worker stopped before finishing its item"))))
-            }
+            (Err(None), None) => Err(WorkerPanic(Mutex::new(Box::new(LOST_RESULT)))),
         }
     }
 }
@@ -361,6 +360,11 @@ fn run_worker<I: Iterator, S, R, E>(
     }))
 }
 
+/// The payload of the [`WorkerPanic`] for a result that went missing although
+/// no worker failed.
+const LOST_RESULT: &str =
+    "A result went missing although no worker failed, which is a bug in ordair";
+
 fn keep_first<T>(first: &Mutex<Option<T>>, failure: T) {
     first.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert(failure);
 }
@@ -370,7 +374,9 @@ fn keep_first<T>(first: &Mutex<Option<T>>, failure: T) {
 /// [`or_unwind`](OrUnwind::or_unwind) resumes it.
 ///
 /// It holds the payload `std::panic::catch_unwind` gives, behind a mutex
-/// only so that it is `Sync`, which `anyhow` and `eyre` need.
+/// only so that it is `Sync`, which `anyhow` and `eyre` need. A result that
+/// goes missing although no worker failed, a bug in ordair, comes back as one
+/// too, with a message saying so.
 pub struct WorkerPanic(Mutex<Box<dyn Any + Send>>);
 
 impl WorkerPanic {
@@ -403,7 +409,10 @@ impl<T> OrUnwind<T> for Result<T, WorkerPanic> {
 impl fmt::Display for WorkerPanic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let payload = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        write!(f, "A worker panicked: {}", message(&**payload))
+        match message(&**payload) {
+            LOST_RESULT => f.write_str(LOST_RESULT),
+            message => write!(f, "A worker panicked: {message}"),
+        }
     }
 }
 
