@@ -13,7 +13,7 @@
 //! let mut out = Vec::new();
 //! ordair::in_order(1..=1000_u64)
 //!     .map(|n| (1..=n).map(|k| k * k).sum::<u64>())
-//!     // `??`: the outer `?` is a worker panic, the inner one is your own error.
+//!     // `??`: the outer `?` is a panic, the inner one is your own error.
 //!     .try_for_each(|sum| writeln!(out, "{sum}"))??;
 //! assert!(out.starts_with(b"1\n5\n14\n30\n"));
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -57,13 +57,13 @@
 //!
 //! # Errors
 //!
-//! A panic in a worker, or an error from `init` or from the consumer, stops
-//! the workers from taking new items and is returned once the items in flight
-//! are done. The result is two: the outer error is a [`WorkerPanic`], which
-//! [`or_unwind`](OrUnwind::or_unwind) resumes, and the inner one is your own
-//! error, untouched, so `??` or `.or_unwind()?` keeps what it captured, such as
-//! an `eyre::Report`'s backtrace. A panic in the consumer is on your own thread
-//! and unwinds out of [`try_for_each`](InOrder::try_for_each). It never hangs.
+//! A panic in a worker or in the consumer, or an error from `init` or from the
+//! consumer, stops the workers from taking new items and is returned once the
+//! items in flight are done. The result is two: the outer error is a
+//! [`Panic`], which [`or_unwind`](OrUnwind::or_unwind) resumes, and the inner
+//! one is your own error, untouched, so `??` or `.or_unwind()?` keeps what it
+//! captured, such as an `eyre::Report`'s backtrace. Either way, the code after
+//! the call runs, e.g. to close what the consumer wrote to. It never hangs.
 //!
 //! ```
 //! use ordair::OrUnwind;
@@ -244,25 +244,26 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
     ///
     /// # Errors
     ///
-    /// When a worker panics or `init` or `consume` returns an error: that
-    /// stops the workers from taking new items, and comes back once the items
-    /// in flight are done. Results stop at the first item that has none.
+    /// When a worker or `consume` panics, or `init` or `consume` returns an
+    /// error: that stops the workers from taking new items, and comes back
+    /// once the items in flight are done. Results stop at the first item that
+    /// has none.
     ///
-    /// A worker panic is the outer error, which
-    /// [`or_unwind`](OrUnwind::or_unwind) resumes. The inner one is your own,
-    /// untouched, so a `?` keeps whatever it captured. A panic wins over an
-    /// error; `consume`'s error wins over `init`'s, as it always comes from an
-    /// earlier item. The losing error is dropped, as a sequential loop would
-    /// never have reached its item; to see it anyway, log it in `init`.
+    /// A panic is the outer error, which [`or_unwind`](OrUnwind::or_unwind)
+    /// resumes. The inner one is your own, untouched, so a `?` keeps whatever
+    /// it captured. A panic wins over an error; `consume`'s wins over a
+    /// worker's or `init`'s, as it always comes from an earlier item. The
+    /// losing one is dropped, as a sequential loop would never have reached
+    /// its item; to see it anyway, log it in `init`.
     ///
     /// # Panics
     ///
-    /// When `consume` panics, after the workers stopped. And when called from
-    /// the only thread of the pool, which would leave no thread to work.
+    /// When called from the only thread of the pool, which would leave no
+    /// thread to work.
     pub fn try_for_each<S, R, E>(
         self,
         mut consume: impl FnMut(R) -> Result<(), E>,
-    ) -> Result<Result<(), E>, WorkerPanic>
+    ) -> Result<Result<(), E>, Panic>
     where
         I: IntoIterator<IntoIter: Send, Item: Send>,
         Init: Fn() -> Result<S, E> + Sync,
@@ -313,16 +314,16 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
             consumed
         });
 
-        let consumed = consumed.unwrap_or_else(|payload| panic::resume_unwind(payload));
+        let consumed = consumed.map_err(|payload| Panic::new(payload, true))?;
         if let Some(payload) = worker_panic.into_inner().unwrap_or_else(PoisonError::into_inner) {
-            return Err(WorkerPanic(Mutex::new(payload)));
+            return Err(Panic::new(payload, false));
         }
         match (consumed, init_failure.into_inner().unwrap_or_else(PoisonError::into_inner)) {
             (Ok(()), None) => Ok(Ok(())),
             (Err(Some(consumer)), _) => Ok(Err(consumer)),
             (Ok(()) | Err(None), Some(init)) => Ok(Err(init)),
             // Only a failed worker leaves a result unsent, and it recorded why.
-            (Err(None), None) => Err(WorkerPanic(Mutex::new(Box::new(LOST_RESULT)))),
+            (Err(None), None) => Err(Panic::new(Box::new(LOST_RESULT), false)),
         }
     }
 }
@@ -360,7 +361,7 @@ fn run_worker<I: Iterator, S, R, E>(
     }))
 }
 
-/// The payload of the [`WorkerPanic`] for a result that went missing although
+/// The payload of the [`Panic`] for a result that went missing although
 /// no worker failed.
 const LOST_RESULT: &str =
     "A result went missing although no worker failed, which is a bug in ordair";
@@ -369,7 +370,7 @@ fn keep_first<T>(first: &Mutex<Option<T>>, failure: T) {
     first.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert(failure);
 }
 
-/// A worker panicked, the outer error of
+/// A worker or the consumer panicked, the outer error of
 /// [`try_for_each`](InOrder::try_for_each);
 /// [`or_unwind`](OrUnwind::or_unwind) resumes it.
 ///
@@ -377,15 +378,22 @@ fn keep_first<T>(first: &Mutex<Option<T>>, failure: T) {
 /// only so that it is `Sync`, which `anyhow` and `eyre` need. A result that
 /// goes missing although no worker failed, a bug in ordair, comes back as one
 /// too, with a message saying so.
-pub struct WorkerPanic(Mutex<Box<dyn Any + Send>>);
+pub struct Panic {
+    payload: Mutex<Box<dyn Any + Send>>,
+    in_consumer: bool,
+}
 
-impl WorkerPanic {
-    /// The payload, as `std::panic::catch_unwind` gives it.
-    pub fn into_payload(self) -> Box<dyn Any + Send> {
-        self.0.into_inner().unwrap_or_else(PoisonError::into_inner)
+impl Panic {
+    fn new(payload: Box<dyn Any + Send>, in_consumer: bool) -> Self {
+        Self { payload: Mutex::new(payload), in_consumer }
     }
 
-    /// Continues the panic on this thread. The panic hook ran when the worker
+    /// The payload, as `std::panic::catch_unwind` gives it.
+    pub fn into_payload(self) -> Box<dyn Any + Send> {
+        self.payload.into_inner().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Continues the panic on this thread. The panic hook ran when it
     /// panicked and does not run again.
     pub fn resume(self) -> ! {
         panic::resume_unwind(self.into_payload())
@@ -395,35 +403,39 @@ impl WorkerPanic {
 /// [`or_unwind`](Self::or_unwind), for the result of
 /// [`try_for_each`](InOrder::try_for_each).
 pub trait OrUnwind<T> {
-    /// The value, or the worker's panic resumed on this thread, as if the
-    /// work had run there.
+    /// The value, or the panic resumed on this thread, as if the work had run
+    /// there.
     fn or_unwind(self) -> T;
 }
 
-impl<T> OrUnwind<T> for Result<T, WorkerPanic> {
+impl<T> OrUnwind<T> for Result<T, Panic> {
     fn or_unwind(self) -> T {
         self.unwrap_or_else(|panic| panic.resume())
     }
 }
 
-impl fmt::Display for WorkerPanic {
+impl fmt::Display for Panic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let payload = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let payload = self.payload.lock().unwrap_or_else(PoisonError::into_inner);
         match message(&**payload) {
             LOST_RESULT => f.write_str(LOST_RESULT),
+            message if self.in_consumer => write!(f, "The consumer panicked: {message}"),
             message => write!(f, "A worker panicked: {message}"),
         }
     }
 }
 
-impl fmt::Debug for WorkerPanic {
+impl fmt::Debug for Panic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let payload = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        f.debug_tuple("WorkerPanic").field(&message(&**payload)).finish()
+        let payload = self.payload.lock().unwrap_or_else(PoisonError::into_inner);
+        f.debug_struct("Panic")
+            .field("in_consumer", &self.in_consumer)
+            .field("message", &message(&**payload))
+            .finish()
     }
 }
 
-impl std::error::Error for WorkerPanic {}
+impl std::error::Error for Panic {}
 
 fn message(panic: &(dyn Any + Send)) -> &str {
     panic

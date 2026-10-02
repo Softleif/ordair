@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Breaking: the outer error is now `Panic` instead of `WorkerPanic`, and it is
+also what a panic in `consume` comes back as, rather than unwinding out of
+`try_for_each`. So the code after the call runs whatever panicked, e.g. to
+close what `consume` wrote to. `.or_unwind()` still resumes the panic.
+
 - The error for a result that went missing although no worker failed now says
   that this is a bug in ordair, rather than reading like an ordinary worker
   panic.

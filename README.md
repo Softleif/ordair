@@ -14,7 +14,7 @@ ordair::in_order(&regions)        // any IntoIterator; borrowing is fine
         |readers, region| process(readers, region),
     )
     // Runs on the calling thread, in input order.
-    // `??`: the outer `?` is a worker panic, the inner one is your own error.
+    // `??`: the outer `?` is a panic, the inner one is your own error.
     .try_for_each(|records| writer.write(records))??;
 ```
 
@@ -34,13 +34,13 @@ No per-worker state? Use `.map(process)` instead of `.map_init`.
 
 ## Errors
 
-`try_for_each` returns `Result<Result<(), E>, WorkerPanic>`:
+`try_for_each` returns `Result<Result<(), E>, Panic>`:
 
 - **The inner error is yours,** from `init` or `consume`, untouched. An
   `eyre::Report` keeps its backtrace and span trace.
-- **The outer error is a worker panic.** It is `Send + Sync`, so `?` turns it
-  into an `anyhow` or `eyre` error. To panic instead, call `.or_unwind()`.
-- **A panic in `consume`** unwinds out of the call, as it would in a loop.
+- **The outer error is a panic,** in a worker or in `consume`. It is
+  `Send + Sync`, so `?` turns it into an `anyhow` or `eyre` error. To panic
+  instead, call `.or_unwind()`.
 
 Either way, the workers stop taking new items and the call returns once the
 items in flight are done. It never hangs.

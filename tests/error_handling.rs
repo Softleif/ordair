@@ -31,7 +31,7 @@ fn anyhow_gets_a_worker_panic_as_an_error() {
         Ok(())
     };
     let error = run().unwrap_err();
-    assert!(error.is::<ordair::WorkerPanic>());
+    assert!(error.is::<ordair::Panic>());
     assert!(error.to_string().contains("boom"), "{error}");
 }
 
@@ -82,6 +82,6 @@ fn color_eyre_gets_a_worker_panic_as_an_error() {
         Ok(())
     };
     let error = run().unwrap_err();
-    assert!(error.downcast_ref::<ordair::WorkerPanic>().is_some());
+    assert!(error.downcast_ref::<ordair::Panic>().is_some());
     assert!(error.to_string().contains("boom"), "{error}");
 }

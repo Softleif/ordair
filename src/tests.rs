@@ -1,4 +1,4 @@
-use crate::{OrUnwind, WorkerPanic, in_order};
+use crate::{OrUnwind, Panic, in_order};
 use rayon_core::ThreadPool;
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
@@ -187,6 +187,23 @@ fn a_panicking_worker_is_the_outer_error_not_a_gap() {
         });
     assert!(result.unwrap_err().to_string().contains("boom"));
     assert_eq!(consumed, (0..30).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_panicking_consumer_is_the_outer_error() {
+    let mut consumed = 0;
+    let result = in_order(0..1_000).pool(&pool(4)).window(4).map(|i| i).try_for_each(|i| {
+        assert_ne!(i, 30, "boom");
+        consumed += 1;
+        Ok::<_, String>(())
+    });
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.starts_with("The consumer panicked: ") && message.contains("boom"),
+        "{message}"
+    );
+    // Code after the call runs, e.g. to close what `consume` wrote to
+    assert_eq!(consumed, 30);
 }
 
 #[test]

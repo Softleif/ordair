@@ -128,7 +128,7 @@ impl Record {
 
 struct Outcome {
     /// `Err` when `try_for_each` unwound.
-    result: thread::Result<Result<Result<(), String>, WorkerPanic>>,
+    result: thread::Result<Result<Result<(), String>, Panic>>,
     consumed: Vec<usize>,
     record: Record,
 }
@@ -264,16 +264,16 @@ fn check(scenario: &Scenario) {
     let limit = [first_panic, consume_fails, *next_panics].into_iter().flatten().min();
     assert!(consumed.len() <= limit.unwrap_or(n).min(n));
 
-    // A panic in `consume` is the caller's own and unwinds out of the
-    // call. Otherwise a worker panic wins, then the consumer's error, then
-    // a failed `init`'s.
+    // Nothing unwinds out of the call. A panic in `consume` wins, as it
+    // comes from an earlier item than any worker's, then a worker panic,
+    // then the consumer's error, then a failed `init`'s.
     let worker_failed = worker_panicked || init_failed;
     match &result {
-        Err(payload) => {
-            assert!(consume_panicked, "unwound with {:?}", message(&**payload));
-            assert_eq!(message(&**payload), "consume panicked");
+        Err(payload) => panic!("unwound with {:?}", message(&**payload)),
+        Ok(Err(panic)) if consume_panicked => {
+            assert_eq!(panic.to_string(), "The consumer panicked: consume panicked");
         }
-        Ok(_) if consume_panicked => panic!("a panic in `consume` did not unwind"),
+        Ok(_) if consume_panicked => panic!("a panic in `consume` went unreported"),
         Ok(Err(panic)) => assert!(worker_panicked, "returned {panic:?}"),
         Ok(Ok(_)) if worker_panicked => panic!("a worker panic went unreported"),
         Ok(Ok(Ok(()))) => {
