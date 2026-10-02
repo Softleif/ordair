@@ -1,6 +1,6 @@
 [package]
 name = "ordair"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Parallel map on a rayon pool whose results are consumed in input order, with a hard bound on how far the workers run ahead"
 license = "MIT OR Apache-2.0"

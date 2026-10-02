@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 Breaking: the outer error is now `Panic` instead of `WorkerPanic`, and it is
 also what a panic in `consume` comes back as, rather than unwinding out of
