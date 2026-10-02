@@ -13,7 +13,8 @@
 //! let mut out = Vec::new();
 //! ordair::in_order(1..=1000_u64)
 //!     .map(|n| (1..=n).map(|k| k * k).sum::<u64>())
-//!     .try_for_each(|sum| writeln!(out, "{sum}"))?;
+//!     // `??`: the outer `?` is a worker panic, the inner one is your own error.
+//!     .try_for_each(|sum| writeln!(out, "{sum}"))??;
 //! assert!(out.starts_with(b"1\n5\n14\n30\n"));
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -32,7 +33,7 @@
 //! ```
 //! use std::io::Write;
 //!
-//! let pool = rayon::ThreadPoolBuilder::new()
+//! let pool = rayon_core::ThreadPoolBuilder::new()
 //!     .num_threads(4)
 //!     .thread_name(|i| format!("reverse-{i}"))
 //!     .build()?;
@@ -49,20 +50,23 @@
 //!             buffer.to_uppercase()
 //!         },
 //!     )
-//!     .try_for_each(|line| writeln!(out, "{line}"))?;
+//!     .try_for_each(|line| writeln!(out, "{line}"))??;
 //! assert_eq!(String::from_utf8(out)?, "AHPLA\nATEB\nAMMAG\nATLED\n");
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! # Errors
 //!
-//! An error from `init` or from the consumer, or a panic in a worker, stops
+//! A panic in a worker, or an error from `init` or from the consumer, stops
 //! the workers from taking new items and is returned once the items in flight
-//! are done; see [`Error`]. A panic in the consumer unwinds out of
-//! [`try_for_each`](InOrder::try_for_each). It never hangs.
+//! are done. The result is two: the outer error is a [`WorkerPanic`], which
+//! [`or_unwind`](OrUnwind::or_unwind) resumes, and the inner one is your own
+//! error, untouched, so `??` or `.or_unwind()?` keeps what it captured, such as
+//! an `eyre::Report`'s backtrace. A panic in the consumer is on your own thread
+//! and unwinds out of [`try_for_each`](InOrder::try_for_each). It never hangs.
 //!
 //! ```
-//! use ordair::{Error, WorkerError};
+//! use ordair::OrUnwind;
 //!
 //! let mut consumed = 0;
 //! let result = ordair::in_order(0..100)
@@ -70,11 +74,34 @@
 //!     .try_for_each(|_| {
 //!         consumed += 1;
 //!         Ok(())
-//!     });
+//!     })
+//!     .or_unwind();
 //! // The item a worker took before its `init` failed has no result, so
 //! // the consumer stops there.
-//! assert!(matches!(result, Err(Error::Worker(WorkerError::Init("no licence left")))));
+//! assert_eq!(result, Err("no licence left"));
 //! assert_eq!(consumed, 0);
+//! ```
+//!
+//! `work` has no error of its own: when it can fail, it returns a `Result`
+//! and `consume` passes the error on with `?`, so it comes back as yours,
+//! from the item it belongs to. `init` and `consume` share one error type,
+//! which `anyhow` and `eyre` make easy; with concrete types, one of them may
+//! need a `map_err`.
+//!
+//! ```
+//! use ordair::OrUnwind;
+//! use std::num::ParseIntError;
+//!
+//! let mut total = 0;
+//! let result = ordair::in_order(["1", "2", "three", "4"])
+//!     .map(|word| word.parse::<u32>())
+//!     .try_for_each(|n| {
+//!         total += n?;
+//!         Ok::<_, ParseIntError>(())
+//!     })
+//!     .or_unwind();
+//! assert_eq!(result.unwrap_err().to_string(), "invalid digit found in string");
+//! assert_eq!(total, 3);
 //! ```
 //!
 //! # How it works
@@ -86,7 +113,7 @@
 //! the consumer blocks until the consumer catches up. `gzp` keeps compressed
 //! blocks in order the same way.
 
-use rayon::ThreadPool;
+use rayon_core::ThreadPool;
 use std::{
     any::Any,
     fmt, iter,
@@ -95,6 +122,7 @@ use std::{
         Mutex, MutexGuard, PoisonError,
         mpsc::{Receiver, SyncSender, sync_channel},
     },
+    thread,
 };
 
 #[cfg(test)]
@@ -176,7 +204,8 @@ impl<'p, I: IntoIterator> InOrder<'p, I> {
     /// thread, so it need not be `Send` and a thread that gets no item builds
     /// none. Unlike rayon's `map_init`, which builds state for every piece it
     /// splits the work into, this is once per thread. When `init` fails, that
-    /// item has no result and the consumer stops before it; see [`Error`].
+    /// item has no result and the consumer stops before it; see
+    /// [`try_for_each`](Self::try_for_each).
     ///
     /// ```
     /// use std::{cell::RefCell, rc::Rc};
@@ -191,7 +220,7 @@ impl<'p, I: IntoIterator> InOrder<'p, I> {
     ///     .try_for_each(|doubled| {
     ///         total += doubled;
     ///         Ok::<_, std::io::Error>(())
-    ///     })?;
+    ///     })??;
     /// assert_eq!(total, 9900);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -215,10 +244,15 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
     ///
     /// # Errors
     ///
-    /// When `init` or `consume` returns an error or a worker panics: that
+    /// When a worker panics or `init` or `consume` returns an error: that
     /// stops the workers from taking new items, and comes back once the items
-    /// in flight are done. Results stop at the first item that has none. See
-    /// [`Error`].
+    /// in flight are done. Results stop at the first item that has none.
+    ///
+    /// A worker panic is the outer error, which
+    /// [`or_unwind`](OrUnwind::or_unwind) resumes. The inner one is your own,
+    /// untouched, so a `?` keeps whatever it captured. A panic wins over an
+    /// error; `consume`'s error wins over `init`'s, as it always comes from an
+    /// earlier item.
     ///
     /// # Panics
     ///
@@ -227,7 +261,7 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
     pub fn try_for_each<S, R, E>(
         self,
         mut consume: impl FnMut(R) -> Result<(), E>,
-    ) -> Result<(), Error<E>>
+    ) -> Result<Result<(), E>, WorkerPanic>
     where
         I: IntoIterator<IntoIter: Send, Item: Send>,
         Init: Fn() -> Result<S, E> + Sync,
@@ -238,14 +272,18 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
         let Self { items, pool, window, init, work } = self;
         let (on_a_pool_thread, threads) = match pool {
             Some(pool) => (pool.current_thread_index().is_some(), pool.current_num_threads()),
-            None => (rayon::current_thread_index().is_some(), rayon::current_num_threads()),
+            None => {
+                (rayon_core::current_thread_index().is_some(), rayon_core::current_num_threads())
+            }
         };
         assert!(!on_a_pool_thread || threads > 1, "ordair called from the only thread of its pool");
         let window = window.unwrap_or_else(|| threads.saturating_mul(4));
         let (pending, results) = sync_channel(window);
         let queue = Queue::new(items.into_iter(), pending);
-        // The first one: when several workers fail, they mostly share a cause.
-        let worker_failure = Mutex::new(None);
+        // The first of each: when several workers fail, they mostly share a
+        // cause.
+        let init_failure = Mutex::new(None);
+        let worker_panic = Mutex::new(None);
 
         let consumed = in_place_scope(pool, |scope| {
             scope.spawn_broadcast(|_, _| {
@@ -254,9 +292,10 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
                 // `init` and none closed the queue, the consumer would wait
                 // forever.
                 queue.close();
-                if let Err(failure) = worked {
-                    let mut first = worker_failure.lock().unwrap_or_else(PoisonError::into_inner);
-                    first.get_or_insert(failure);
+                match worked {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => keep_first(&init_failure, error),
+                    Err(payload) => keep_first(&worker_panic, payload),
                 }
             });
 
@@ -273,17 +312,18 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
             consumed
         });
 
-        let worker_failure = worker_failure.into_inner().unwrap_or_else(PoisonError::into_inner);
-        match (consumed, worker_failure) {
-            (Err(payload), _) => panic::resume_unwind(payload),
-            (Ok(Ok(())), None) => Ok(()),
-            (Ok(Ok(()) | Err(None)), Some(worker)) => Err(Error::Worker(worker)),
-            (Ok(Err(Some(consumer))), None) => Err(Error::Consumer(consumer)),
-            (Ok(Err(Some(consumer))), Some(worker)) => Err(Error::Both { worker, consumer }),
+        let consumed = consumed.unwrap_or_else(|payload| panic::resume_unwind(payload));
+        if let Some(payload) = worker_panic.into_inner().unwrap_or_else(PoisonError::into_inner) {
+            return Err(WorkerPanic(Mutex::new(payload)));
+        }
+        match (consumed, init_failure.into_inner().unwrap_or_else(PoisonError::into_inner)) {
+            (Ok(()), None) => Ok(Ok(())),
+            (Err(Some(consumer)), _) => Ok(Err(consumer)),
+            (Ok(()) | Err(None), Some(init)) => Ok(Err(init)),
             // Only a failed worker leaves a result unsent, and it recorded why.
-            (Ok(Err(None)), None) => Err(Error::Worker(WorkerError::Panicked(Box::new(
-                "A worker stopped before finishing its item",
-            )))),
+            (Err(None), None) => {
+                Err(WorkerPanic(Mutex::new(Box::new("A worker stopped before finishing its item"))))
+            }
         }
     }
 }
@@ -291,20 +331,21 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
 /// `pool`'s scope, or the current pool's.
 fn in_place_scope<'scope, R>(
     pool: Option<&ThreadPool>,
-    op: impl FnOnce(&rayon::Scope<'scope>) -> R,
+    op: impl FnOnce(&rayon_core::Scope<'scope>) -> R,
 ) -> R {
     match pool {
         Some(pool) => pool.in_place_scope(op),
-        None => rayon::in_place_scope(op),
+        None => rayon_core::in_place_scope(op),
     }
 }
 
-/// Takes items until there are none left or the consumer is gone.
+/// Takes items until there are none left or the consumer is gone. The outer
+/// error is a panic.
 fn run_worker<I: Iterator, S, R, E>(
     queue: &Queue<I, R>,
     init: &impl Fn() -> Result<S, E>,
     work: &impl Fn(&mut S, I::Item) -> R,
-) -> Result<(), WorkerError<E>> {
+) -> thread::Result<Result<(), E>> {
     panic::catch_unwind(AssertUnwindSafe(|| {
         let Some(first) = queue.take() else { return Ok(()) };
         // If this fails, the first item is dropped unanswered, which is where
@@ -318,93 +359,62 @@ fn run_worker<I: Iterator, S, R, E>(
         }
         Ok(())
     }))
-    .map_err(WorkerError::Panicked)?
-    .map_err(WorkerError::Init)
 }
 
-/// Why [`try_for_each`](InOrder::try_for_each) stopped before consuming every
-/// item.
-pub enum Error<E> {
-    /// A worker failed.
-    Worker(WorkerError<E>),
-    /// `consume` returned an error.
-    Consumer(E),
-    /// A worker failed and, independently, so did `consume`: a failed worker
-    /// only stops the others from taking items, and a failed `consume` only
-    /// stops the workers, so neither caused the other.
-    Both { worker: WorkerError<E>, consumer: E },
+fn keep_first<T>(first: &Mutex<Option<T>>, failure: T) {
+    first.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert(failure);
 }
 
-/// How a worker failed.
-pub enum WorkerError<E> {
-    /// `init` returned an error.
-    Init(E),
-    /// `init`, `work` or the iterator panicked; this is the payload
-    /// `std::panic::catch_unwind` gives.
-    Panicked(Box<dyn Any + Send>),
+/// A worker panicked, the outer error of
+/// [`try_for_each`](InOrder::try_for_each);
+/// [`or_unwind`](OrUnwind::or_unwind) resumes it.
+///
+/// It holds the payload `std::panic::catch_unwind` gives, behind a mutex
+/// only so that it is `Sync`, which `anyhow` and `eyre` need.
+pub struct WorkerPanic(Mutex<Box<dyn Any + Send>>);
+
+impl WorkerPanic {
+    /// The payload, as `std::panic::catch_unwind` gives it.
+    pub fn into_payload(self) -> Box<dyn Any + Send> {
+        self.0.into_inner().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Continues the panic on this thread. The panic hook ran when the worker
+    /// panicked and does not run again.
+    pub fn resume(self) -> ! {
+        panic::resume_unwind(self.into_payload())
+    }
 }
 
-impl<E: fmt::Display> fmt::Display for Error<E> {
+/// [`or_unwind`](Self::or_unwind), for the result of
+/// [`try_for_each`](InOrder::try_for_each).
+pub trait OrUnwind<T> {
+    /// The value, or the worker's panic resumed on this thread, as if the
+    /// work had run there.
+    fn or_unwind(self) -> T;
+}
+
+impl<T> OrUnwind<T> for Result<T, WorkerPanic> {
+    fn or_unwind(self) -> T {
+        self.unwrap_or_else(|panic| panic.resume())
+    }
+}
+
+impl fmt::Display for WorkerPanic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Worker(worker) => worker.fmt(f),
-            Self::Consumer(consumer) => consumer.fmt(f),
-            Self::Both { worker, consumer } => {
-                write!(f, "{consumer}; independently, a worker failed: {worker}")
-            }
-        }
+        let payload = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        write!(f, "A worker panicked: {}", message(&**payload))
     }
 }
 
-impl<E: fmt::Display> fmt::Display for WorkerError<E> {
+impl fmt::Debug for WorkerPanic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Init(error) => error.fmt(f),
-            Self::Panicked(payload) => write!(f, "A worker panicked: {}", message(&**payload)),
-        }
+        let payload = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        f.debug_tuple("WorkerPanic").field(&message(&**payload)).finish()
     }
 }
 
-impl<E: fmt::Debug> fmt::Debug for Error<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Worker(worker) => f.debug_tuple("Worker").field(worker).finish(),
-            Self::Consumer(consumer) => f.debug_tuple("Consumer").field(consumer).finish(),
-            Self::Both { worker, consumer } => {
-                f.debug_struct("Both").field("worker", worker).field("consumer", consumer).finish()
-            }
-        }
-    }
-}
-
-impl<E: fmt::Debug> fmt::Debug for WorkerError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Init(error) => f.debug_tuple("Init").field(error).finish(),
-            Self::Panicked(payload) => {
-                f.debug_tuple("Panicked").field(&message(&**payload)).finish()
-            }
-        }
-    }
-}
-
-impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Worker(worker) => worker.source(),
-            Self::Consumer(consumer) | Self::Both { consumer, .. } => consumer.source(),
-        }
-    }
-}
-
-impl<E: std::error::Error + 'static> std::error::Error for WorkerError<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Init(error) => error.source(),
-            Self::Panicked(_) => None,
-        }
-    }
-}
+impl std::error::Error for WorkerPanic {}
 
 fn message(panic: &(dyn Any + Send)) -> &str {
     panic

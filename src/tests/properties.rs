@@ -128,7 +128,7 @@ impl Record {
 
 struct Outcome {
     /// `Err` when `try_for_each` unwound.
-    result: thread::Result<Result<(), Error<String>>>,
+    result: thread::Result<Result<Result<(), String>, WorkerPanic>>,
     consumed: Vec<usize>,
     record: Record,
 }
@@ -265,33 +265,25 @@ fn check(scenario: &Scenario) {
     assert!(consumed.len() <= limit.unwrap_or(n).min(n));
 
     // A panic in `consume` is the caller's own and unwinds out of the
-    // call. Otherwise a worker's failure and the consumer's are both
-    // reported; of several worker failures, any one may be.
+    // call. Otherwise a worker panic wins, then the consumer's error, then
+    // a failed `init`'s.
     let worker_failed = worker_panicked || init_failed;
-    let expected_worker = |worker: &WorkerError<String>| match worker {
-        WorkerError::Panicked(_) => worker_panicked,
-        WorkerError::Init(error) => init_failed && error == "init failed",
-    };
     match &result {
         Err(payload) => {
             assert!(consume_panicked, "unwound with {:?}", message(&**payload));
             assert_eq!(message(&**payload), "consume panicked");
         }
         Ok(_) if consume_panicked => panic!("a panic in `consume` did not unwind"),
-        Ok(Ok(())) => {
-            assert!(!worker_failed && !consume_failed, "a failure went unreported");
+        Ok(Err(panic)) => assert!(worker_panicked, "returned {panic:?}"),
+        Ok(Ok(_)) if worker_panicked => panic!("a worker panic went unreported"),
+        Ok(Ok(Ok(()))) => {
+            assert!(!init_failed && !consume_failed, "a failure went unreported");
             assert_eq!(consumed.len(), n);
         }
-        Ok(Err(Error::Worker(worker))) => {
-            assert!(expected_worker(worker) && !consume_failed, "returned {worker:?}");
-        }
-        Ok(Err(Error::Consumer(error))) => {
-            assert!(!worker_failed, "a worker's failure went unreported");
-            assert_eq!(error, "consume failed");
-        }
-        Ok(Err(Error::Both { worker, consumer })) => {
-            assert!(expected_worker(worker), "returned {worker:?}");
-            assert_eq!(consumer, "consume failed");
+        Ok(Ok(Err(error))) if consume_failed => assert_eq!(error, "consume failed"),
+        Ok(Ok(Err(error))) => {
+            assert!(init_failed, "returned {error:?}");
+            assert_eq!(error, "init failed");
         }
     }
 

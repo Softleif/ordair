@@ -1,6 +1,6 @@
 [package]
 name = "ordair"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Parallel map on a rayon pool whose results are consumed in input order, with a hard bound on how far the workers run ahead"
 license = "MIT OR Apache-2.0"
@@ -10,10 +10,15 @@ categories = ["concurrency"]
 repository = "https://github.com/Softleif/ordair"
 
 [dependencies]
-rayon = "1.12"
+rayon-core = "1.13"
 
 [dev-dependencies]
+anyhow = "1"
+color-eyre = "0.6"
 hegeltest = "0.48.1"
+tracing = "0.1"
+tracing-error = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 
 [lints.clippy]
 dbg_macro = "warn"

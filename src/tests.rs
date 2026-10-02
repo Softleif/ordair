@@ -1,5 +1,5 @@
-use crate::{Error, WorkerError, in_order};
-use rayon::ThreadPool;
+use crate::{OrUnwind, WorkerPanic, in_order};
+use rayon_core::ThreadPool;
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
     thread,
@@ -9,7 +9,7 @@ use std::{
 mod properties;
 
 fn pool(threads: usize) -> ThreadPool {
-    rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap()
+    rayon_core::ThreadPoolBuilder::new().num_threads(threads).build().unwrap()
 }
 
 #[test]
@@ -28,6 +28,7 @@ fn results_arrive_in_input_order_behind_a_slow_item() {
             seen.push(i);
             Ok::<_, String>(())
         })
+        .unwrap()
         .unwrap();
     assert_eq!(seen, (0..500).collect::<Vec<_>>());
 }
@@ -52,6 +53,7 @@ fn workers_never_run_more_than_the_window_ahead() {
             consumed += 1;
             Ok::<_, String>(())
         })
+        .unwrap()
         .unwrap();
     assert_eq!(consumed, 200);
 }
@@ -74,6 +76,7 @@ fn the_default_window_is_four_per_thread() {
             consumed += 1;
             Ok::<_, String>(())
         })
+        .unwrap()
         .unwrap();
     assert_eq!(consumed, 200);
 }
@@ -89,11 +92,12 @@ fn runs_on_the_current_pool_by_default() {
     let mut threads = Vec::new();
     pool(3)
         .install(|| {
-            in_order(0..50).map(|_| rayon::current_num_threads()).try_for_each(|n| {
+            in_order(0..50).map(|_| rayon_core::current_num_threads()).try_for_each(|n| {
                 threads.push(n);
                 Ok::<_, String>(())
             })
         })
+        .unwrap()
         .unwrap();
     assert_eq!(threads, [3; 50]);
 }
@@ -106,6 +110,7 @@ fn state_is_built_once_per_worker() {
         .window(8)
         .map_init(|| Ok(built.fetch_add(1, Ordering::SeqCst)), |_, i| i)
         .try_for_each(|_| Ok::<_, String>(()))
+        .unwrap()
         .unwrap();
     assert!((1..=4).contains(&built.load(Ordering::SeqCst)));
 }
@@ -117,6 +122,7 @@ fn a_thread_without_items_builds_no_state() {
         .pool(&pool(8))
         .map_init(|| Ok(built.fetch_add(1, Ordering::SeqCst)), |_, i| i)
         .try_for_each(|_| Ok::<_, String>(()))
+        .unwrap()
         .unwrap();
     assert_eq!(built.load(Ordering::SeqCst), 1);
 }
@@ -132,7 +138,7 @@ fn a_consumer_error_stops_the_workers() {
             i
         })
         .try_for_each(|i| if i == 10 { Err("disk full".to_owned()) } else { Ok(()) });
-    assert_eq!(result.unwrap_err().to_string(), "disk full");
+    assert_eq!(result.unwrap(), Err("disk full".to_owned()));
     assert!(started.load(Ordering::SeqCst) < 100);
 }
 
@@ -160,13 +166,13 @@ fn an_init_error_is_returned_after_the_taken_items_are_consumed() {
             consumed.push(i);
             Ok(())
         });
-    assert_eq!(result.unwrap_err().to_string(), "cannot open the BAM");
+    assert_eq!(result.unwrap(), Err("cannot open the BAM".to_owned()));
     assert!(consumed.len() < 1_000);
     assert_eq!(consumed, (0..consumed.len()).collect::<Vec<_>>());
 }
 
 #[test]
-fn a_panicking_worker_is_an_error_not_a_gap() {
+fn a_panicking_worker_is_the_outer_error_not_a_gap() {
     let mut consumed = Vec::new();
     let result = in_order(0..100)
         .pool(&pool(4))
@@ -179,13 +185,22 @@ fn a_panicking_worker_is_an_error_not_a_gap() {
             consumed.push(i);
             Ok::<_, String>(())
         });
-    assert!(matches!(&result, Err(Error::Worker(WorkerError::Panicked(_)))));
     assert!(result.unwrap_err().to_string().contains("boom"));
     assert_eq!(consumed, (0..30).collect::<Vec<_>>());
 }
 
 #[test]
-fn a_worker_and_a_consumer_failing_are_both_returned() {
+#[should_panic(expected = "boom")]
+fn or_unwind_resumes_a_worker_panic() {
+    let _ = in_order(0..10)
+        .pool(&pool(2))
+        .map(|i| assert_ne!(i, 3, "boom"))
+        .try_for_each(|()| Ok::<_, String>(()))
+        .or_unwind();
+}
+
+#[test]
+fn a_consumer_error_wins_over_an_init_error() {
     let attempts = AtomicUsize::new(0);
     let result = in_order(0..2)
         .pool(&pool(2))
@@ -199,12 +214,9 @@ fn a_worker_and_a_consumer_failing_are_both_returned() {
             |(), i| thread::sleep(Duration::from_millis(100 * (1 - i))),
         )
         .try_for_each(|()| Err("consume failed".to_owned()));
-    match result {
-        Err(Error::Both { worker: WorkerError::Init(worker), consumer }) => {
-            assert_eq!((worker.as_str(), consumer.as_str()), ("init failed", "consume failed"));
-        }
-        other => panic!("expected both failures, got {other:?}"),
-    }
+    // The consumer failed on the first item, the second worker's `init` on
+    // the second, so the consumer's error is what a sequential loop returns.
+    assert_eq!(result.unwrap(), Err("consume failed".to_owned()));
 }
 
 #[test]
@@ -219,7 +231,7 @@ fn can_be_called_from_a_thread_of_its_pool() {
                 Ok::<_, String>(())
             })
         });
-        done.send((result.is_ok(), seen)).ok();
+        done.send((matches!(result, Ok(Ok(()))), seen)).ok();
     });
     let (ok, seen) = finished.recv_timeout(Duration::from_secs(5)).expect("hung");
     assert!(ok);
