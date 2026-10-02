@@ -1,0 +1,69 @@
+[package]
+name = "ordair"
+version = "0.1.0"
+edition = "2024"
+description = "Parallel map on a rayon pool whose results are consumed in input order, with a hard bound on how far the workers run ahead"
+license = "MIT OR Apache-2.0"
+authors = ["Pascal Hertleif <pascal@softleif.se>"]
+keywords = ["parallel", "ordered", "rayon", "pipeline", "backpressure"]
+categories = ["concurrency"]
+repository = "https://github.com/Softleif/ordair"
+
+[dependencies]
+rayon = "1.12"
+
+[dev-dependencies]
+hegeltest = "0.48.1"
+
+[lints.clippy]
+dbg_macro = "warn"
+panic = "deny"
+indexing_slicing = "warn"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "warn"
+unwrap_in_result = "warn"
+arithmetic_side_effects = "warn"
+ok_expect = "warn"
+
+# Use tracing
+print_stdout = "warn"
+
+# Numbers are hard
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+comparison_chain = "warn"
+range_minus_one = "warn"
+range_plus_one = "warn"
+lossy_float_literal = "warn"
+non_zero_suggestions = "warn"
+
+# Some pedantic lints we like
+doc_link_with_quotes = "warn"
+doc_markdown = "warn"
+explicit_into_iter_loop = "warn"
+format_collect = "warn"
+format_push_string = "warn"
+index_refutable_slice = "warn"
+default_trait_access = "warn"
+rc_buffer = "warn"
+mem_forget = "warn"
+return_and_then = "warn"
+same_name_method = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+manual_let_else = "warn"
+manual_is_variant_and = "warn"
+manual_assert = "warn"
+manual_string_new = "warn"
+option_option = "warn"
+equatable_if_let = "warn"
+allow_attributes_without_reason = "warn"
+infinite_loop = "warn"
+create_dir = "warn"
+pathbuf_init_then_push = "warn"
+format_in_format_args = "warn"
+
+# The property test's engine; it runs thousands of cases in a debug build.
+[profile.dev.package.hegeltest]
+opt-level = 3

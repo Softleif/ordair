@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  shear:
+    name: Unused dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-shear
+      - run: cargo shear --locked
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      # Broken intra-doc links are only warnings otherwise.
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+
+  test:
+    name: test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # A concurrency crate: x86-64 and arm64 order memory differently.
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: clippy
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+      - name: Clippy
+        id: clippy
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets --all-features
+      # hegel picks its `ci` profile on GitHub Actions: 2000 cases from
+      # hegel.toml, a fixed seed.
+      - name: Test
+        id: test
+        continue-on-error: true
+        run: cargo nextest run --locked --profile ci
+      # The property test is about races, and an optimised build interleaves
+      # differently.
+      - name: Test (release)
+        id: release
+        continue-on-error: true
+        run: cargo nextest run --locked --profile ci --release
+      # nextest does not run doctests.
+      - name: Doctests
+        id: doctest
+        continue-on-error: true
+        run: cargo test --locked --doc
+      # `continue-on-error` above only lets every step report before the job
+      # stops, so each one must be named here.
+      - name: Fail if clippy, tests or doctests failed
+        if: >-
+          steps.clippy.outcome == 'failure'
+          || steps.test.outcome == 'failure'
+          || steps.release.outcome == 'failure'
+          || steps.doctest.outcome == 'failure'
+        run: exit 1

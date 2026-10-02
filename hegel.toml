@@ -1,0 +1,22 @@
+# Hegel settings. See `hegel::docs::settings`.
+#
+# `behaves_as_promised` builds a pool per case, so a case takes about a
+# millisecond and 2000 of them ~3 s. The proptest ran 512, but 512 missed a
+# mutation that only shows in a race (`Queue::lock` not closing a poisoned
+# queue: a second worker pulls from the iterator between the panic and
+# the worker closing it), which 2000 caught in each try.
+#
+# For a deeper run: `HEGEL_DEFAULT_PROFILE=thorough cargo nextest run --release`.
+# The nightly workflow does that on every runner.
+
+[profiles.development]
+test_cases = 2000
+
+[profiles.ci]
+test_cases = 2000
+
+# On CI this extends `ci`, which fixes the seed; the nightly run should draw
+# new cases each night instead.
+[profiles.thorough]
+test_cases = 20000
+derandomize = false
