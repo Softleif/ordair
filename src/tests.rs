@@ -7,6 +7,7 @@ use std::{
 };
 
 mod properties;
+mod sharing;
 
 fn pool(threads: usize) -> ThreadPool {
     rayon_core::ThreadPoolBuilder::new().num_threads(threads).build().unwrap()
