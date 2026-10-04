@@ -492,3 +492,60 @@ fn stages_can_share_a_pool(tc: TestCase) {
         .collect();
     assert_eq!(result.unwrap().unwrap(), expected);
 }
+
+/// While there are items to start, every thread of the pool works on the
+/// map, as `pool` promises: as many items are worked on at once as there are
+/// threads, or items in the window; and never more than the window allows
+/// besides the one the consumer waits for.
+///
+/// Each item waits, for up to a second, until that many are worked on at
+/// once, so that a slow machine cannot make it look otherwise.
+#[hegel::test]
+fn every_thread_works_while_there_are_items(tc: TestCase) {
+    let threads = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+    let window = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
+    let len = tc.draw(gs::integers::<usize>().max_value(24));
+    let caller = tc.draw(caller().print_as_debug());
+    // On the global pool, the threads are the machine's.
+    let pool_threads = match caller {
+        Caller::Global => rayon_core::current_num_threads(),
+        _ => threads,
+    };
+    let (least, most) = (pool_threads.min(window).min(len), pool_threads.min(window + 1).min(len));
+    let peak = with_deadline(move || {
+        let pool = pool(threads);
+        let (working, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let run = || {
+            let map = in_order(0..len).window(window);
+            let map = match caller {
+                Caller::Outside | Caller::OtherPool(_) => map.pool(&pool),
+                Caller::Inside | Caller::Global => map,
+            };
+            map.map(|_| {
+                let now = working.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                let start = std::time::Instant::now();
+                while peak.load(Ordering::SeqCst) < least
+                    && start.elapsed() < Duration::from_secs(1)
+                {
+                    thread::sleep(Duration::from_micros(100));
+                }
+                working.fetch_sub(1, Ordering::SeqCst);
+            })
+            .try_for_each(|()| Ok::<_, String>(()))
+        };
+        let result = match caller {
+            Caller::Outside | Caller::Global => run(),
+            Caller::Inside => pool.install(run),
+            Caller::OtherPool(threads) => self::pool(threads).install(run),
+        };
+        assert!(matches!(result, Ok(Ok(()))));
+        peak.into_inner()
+    });
+    assert!(peak <= most, "{peak} at once, more than {most}");
+    // The global pool is shared with the other tests, whose work may hold
+    // some of its threads for as long as it likes.
+    if !matches!(caller, Caller::Global) {
+        assert!(peak >= least, "{peak} at once, fewer than {least}");
+    }
+}

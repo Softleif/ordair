@@ -47,12 +47,15 @@ workers, like an error from `consume` does.
   such results pile up.
 - **Per-worker state.** Built on the worker's own thread when it takes its
   first item. It need not be `Send` or `Clone`, and building it may fail.
-- **Your pool, shared.** Or the current one. A worker that would get more than
-  `window` items ahead gives its thread back instead of blocking it, so
-  `consume` and the work can use the same pool: `install`, `join`, a parallel
-  iterator, a library that uses rayon inside, another map. Calling it from one
-  of the pool's own threads works too, even the only one, and so does chaining
-  maps on one pool.
+- **Your pool, shared.** Or the current one. Workers never wait for the
+  consumer: when they run out of items to start, they give their threads back.
+  So the items, the work and `consume` can all use the same pool: `install`,
+  `join`, `broadcast`, a parallel iterator, a library that uses rayon inside,
+  another map. Calling it from one of the pool's own threads works too, even
+  the only one, and so does chaining maps on one pool.
+- **Items need not be `Send`.** They are taken on the calling thread, as the
+  window has room. A slow iterator slows the consumer, so put expensive work in
+  `map`.
 - **One dependency:** `rayon-core`, the pool half of `rayon`.
 
 ## Errors
@@ -76,15 +79,16 @@ with `anyhow` or `eyre`; with concrete types, one of them may need a `map_err`.
 
 ## How it works
 
-Each item gets a one-shot channel for its result. The receiving end is queued
-for the consumer when the item is taken, so the queue is in input order.
+The consumer takes the items, on the calling thread, while the window has room.
+Each item gets a one-shot channel for its result; the consumer keeps the
+receiving ends in a queue, so the results come out in input order.
 
-A worker takes a place in the window before it takes an item. When there is
-none, it returns its thread to the pool rather than waiting, and the consumer
-spawns a replacement each time it takes a result off the queue. The state
-`init` builds stays behind on its thread for whichever worker runs there next,
-and is dropped there at the end. A consumer on a thread of the pool runs the
-pool's jobs while it waits, as rayon's `join` does.
+Workers take the items the consumer took. When there are none left, a worker
+returns its thread to the pool, and the consumer starts a new one when it takes
+more. A worker that leaves items behind starts another, up to one per thread.
+The state `init` builds stays behind on its thread for whichever worker runs
+there next, and is dropped there at the end. A consumer on a thread of the pool
+runs the pool's jobs while it waits, as rayon's `join` does.
 
 ## Alternatives
 

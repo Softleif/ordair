@@ -9,19 +9,23 @@
   `mem::forget`ten. A worker panic or an `init` error ends it early and comes
   back in the same `Result<Result<T, E>, Panic>`; dropping it early stops the
   workers. `try_for_each` is now a thin wrapper over it.
-- The map no longer occupies its pool while the consumer catches up. Before, a
-  worker blocked its thread whenever the window was full, so a `consume` that
-  used the same pool hung: `install`, `join`, a parallel iterator, a library
-  using rayon inside, or another map. With the default, the global pool, that
-  was easy to run into. Now such a worker gives its thread back, and the
-  consumer spawns a replacement for each result it takes. Using the pool from
-  `work`, and chaining maps on one pool, work as well.
+- The map shares its pool. Before, a worker blocked its thread whenever the
+  window was full, so a `consume` that used the same pool hung: `install`,
+  `join`, a parallel iterator, a library using rayon inside, or another map.
+  With the default, the global pool, that was easy to run into. Now workers
+  never wait for the consumer, and give their threads back when there is
+  nothing to start. The items, the work and the consumer can all use the pool,
+  and maps can be chained on one pool.
+- The items are taken on the calling thread, by the consumer, as the window
+  has room, rather than by the workers under a lock. They need not be `Send`
+  any more. A slow `next` now slows the consumer rather than a worker.
 - Calling it from the only thread of a pool works now, rather than panicking:
   a consumer on a thread of the pool runs the pool's jobs while it waits.
-- The window is now exact: no worker takes an item beyond it while it waits
-  for room.
 - `init`'s states are dropped on their threads once the call is done, by a
-  `broadcast` on the pool, rather than as each worker stops.
+  `broadcast` on the pool, rather than as each worker stops. A pool built with
+  `use_current_thread` waits for that thread to join in.
+- The window counts the items taken but not started too, and no item is taken
+  beyond it.
 
 ## 0.3.0
 

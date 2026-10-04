@@ -24,8 +24,9 @@ struct Slot<S> {
 
 // SAFETY: a slot is only ever touched through `claim` and `drop_mine`, which
 // pick it by `rayon_core::current_thread_index()`. Workers and the broadcast
-// in `drop_mine` run on the threads of the pool the slots were made for, so
-// each slot is only touched by the one thread with its index: `S` never moves
+// in `drop_mine` run on the threads of the pool the slots were made for, as
+// rayon only ever runs a pool's jobs on that pool's own threads, so each slot
+// is only touched by the one thread with its index: `S` never moves
 // threads and the `Cell` is never shared. That thread can come back to the
 // slot further down its own stack, by stealing a worker while one is waiting
 // in `work`; `claimed` turns that second claim away.
