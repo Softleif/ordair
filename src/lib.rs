@@ -19,6 +19,12 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! [`with_iter`](InOrder::with_iter) runs it too, but lends a closure an
+//! [`Iterator`] over the results instead, for `zip`, `take_while`, a `for`
+//! loop with `break` or an API that takes `impl Iterator`. The iterator cannot
+//! leave the closure, which keeps the borrowing, the errors and the promise
+//! below that it never hangs.
+//!
 //! # Per-worker state, the pool and the window
 //!
 //! [`map_init`](InOrder::map_init) builds some state once per worker thread,
@@ -134,18 +140,19 @@ mod tests;
 ///
 /// `items` can be anything that iterates, borrowed data included; it is
 /// iterated from the worker threads, one item at a time. Nothing runs until
-/// [`try_for_each`](InOrder::try_for_each).
+/// [`try_for_each`](InOrder::try_for_each) or
+/// [`with_iter`](InOrder::with_iter).
 pub fn in_order<I: IntoIterator>(items: I) -> InOrder<'static, I> {
     InOrder { items, pool: None, window: None, init: (), work: () }
 }
 
 /// A parallel map built by [`in_order`], run by
-/// [`try_for_each`](Self::try_for_each).
+/// [`try_for_each`](Self::try_for_each) or [`with_iter`](Self::with_iter).
 ///
 /// [`map`](Self::map) or [`map_init`](Self::map_init) sets the work;
 /// [`pool`](Self::pool) and [`window`](Self::window) are optional and can be
 /// set before or after it.
-#[must_use = "nothing runs until `try_for_each`"]
+#[must_use = "nothing runs until `try_for_each` or `with_iter`"]
 pub struct InOrder<'p, I, Init = (), Work = ()> {
     items: I,
     pool: Option<&'p ThreadPool>,
@@ -271,6 +278,71 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
         R: Send,
         E: Send,
     {
+        self.with_iter(|mut results| results.try_for_each(&mut consume))
+    }
+
+    /// Runs the map and lends `f` an iterator over the results, on the
+    /// calling thread, in the order of the items; returns what `f` returns
+    /// once the items in flight are done.
+    ///
+    /// The iterator is an ordinary [`Iterator`], so `zip`, `take_while`, a
+    /// `for` loop with `break` or an API that takes `impl Iterator` all work,
+    /// but it cannot outlive `f`. That is what lets the items, `work` and
+    /// `init`'s state borrow, and what guarantees the workers stop whatever
+    /// `f` does with the iterator.
+    ///
+    /// ```
+    /// use std::io::Write;
+    ///
+    /// let words = ["alpha", "beta", "gamma", "delta"];
+    /// let mut out = Vec::new();
+    /// ordair::in_order(&words)
+    ///     .map(|word| word.to_uppercase())
+    ///     .with_iter(|lines| {
+    ///         for line in lines.take(2) {
+    ///             writeln!(out, "{line}")?;
+    ///         }
+    ///         Ok::<_, std::io::Error>(())
+    ///     })??;
+    /// assert_eq!(String::from_utf8(out)?, "ALPHA\nBETA\n");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// Dropping the iterator before it ends, or returning without finishing
+    /// it, stops the workers from taking new items, like an error from
+    /// `consume` in [`try_for_each`](Self::try_for_each) does. They finish the
+    /// items in flight, and their results are dropped.
+    ///
+    /// # Errors
+    ///
+    /// A worker panic or an `init` error ends the iterator early, at the
+    /// first item that has no result; the iterator cannot tell that apart from
+    /// the end of the items, but the result can. As in
+    /// [`try_for_each`](Self::try_for_each):
+    ///
+    /// - A panic in a worker or in `f` is the outer error, and wins over
+    ///   everything else, even when `f` stopped before the item that panicked.
+    /// - An error from `f` wins over an error from `init`.
+    /// - An error from `init` is returned when the iterator ended at the item
+    ///   it left without a result, even when `f` returned `Ok`. Had `f`
+    ///   stopped before that item, it is dropped, as a sequential loop would
+    ///   never have reached it.
+    ///
+    /// # Panics
+    ///
+    /// When called from the only thread of the pool, which would leave no
+    /// thread to work.
+    pub fn with_iter<S, R, E, T>(
+        self,
+        f: impl for<'a> FnOnce(Iter<'a, R>) -> Result<T, E>,
+    ) -> Result<Result<T, E>, Panic>
+    where
+        I: IntoIterator<IntoIter: Send, Item: Send>,
+        Init: Fn() -> Result<S, E> + Sync,
+        Work: Fn(&mut S, I::Item) -> R + Sync,
+        R: Send,
+        E: Send,
+    {
         let Self { items, pool, window, init, work } = self;
         let (on_a_pool_thread, threads) = match pool {
             Some(pool) => (pool.current_thread_index().is_some(), pool.current_num_threads()),
@@ -287,7 +359,7 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
         let init_failure = Mutex::new(None);
         let worker_panic = Mutex::new(None);
 
-        let consumed = in_place_scope(pool, |scope| {
+        let (consumed, gap) = in_place_scope(pool, |scope| {
             scope.spawn_broadcast(|_, _| {
                 let worked = run_worker(&queue, &init, &work);
                 // However the worker stopped: if every worker panicked in
@@ -301,30 +373,93 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
                 }
             });
 
-            // `Err(None)` is a result that never came.
-            let consumed = panic::catch_unwind(AssertUnwindSafe(|| {
-                results.iter().try_for_each(|result: Receiver<R>| match result.recv() {
-                    Ok(result) => consume(result).map_err(Some),
-                    Err(_) => Err(None),
-                })
-            }));
+            // `f` only borrows this, so the receiver is dropped here whatever
+            // `f` did with the iterator, `mem::forget` included.
+            let mut consumer = Consumer { results: Some(results), gap: false };
+            let consumed =
+                panic::catch_unwind(AssertUnwindSafe(|| f(Iter { consumer: &mut consumer })));
             // Workers blocked on queueing a result wake up to a disconnected
             // channel and stop.
-            drop(results);
-            consumed
+            consumer.results = None;
+            (consumed, consumer.gap)
         });
 
         let consumed = consumed.map_err(|payload| Panic::new(payload, true))?;
         if let Some(payload) = worker_panic.into_inner().unwrap_or_else(PoisonError::into_inner) {
             return Err(Panic::new(payload, false));
         }
-        match (consumed, init_failure.into_inner().unwrap_or_else(PoisonError::into_inner)) {
-            (Ok(()), None) => Ok(Ok(())),
-            (Err(Some(consumer)), _) => Ok(Err(consumer)),
-            (Ok(()) | Err(None), Some(init)) => Ok(Err(init)),
-            // Only a failed worker leaves a result unsent, and it recorded why.
-            (Err(None), None) => Err(Panic::new(Box::new(LOST_RESULT), false)),
+        match (consumed, gap) {
+            (Err(consumer), _) => Ok(Err(consumer)),
+            (Ok(value), false) => Ok(Ok(value)),
+            (Ok(_), true) => {
+                match init_failure.into_inner().unwrap_or_else(PoisonError::into_inner) {
+                    Some(init) => Ok(Err(init)),
+                    // Only a failed worker leaves a result unsent, and it
+                    // recorded why.
+                    None => Err(Panic::new(Box::new(LOST_RESULT), false)),
+                }
+            }
         }
+    }
+}
+
+/// The results of a map, in the order of its items, lent to the closure of
+/// [`with_iter`](InOrder::with_iter).
+///
+/// It ends when the items do, or early at the first item that has no result
+/// because a worker panicked or its `init` failed; `with_iter`'s result says
+/// which. Dropping it stops the workers from taking new items.
+///
+/// It cannot leave the closure:
+///
+/// ```compile_fail
+/// let words = ["alpha", "beta"];
+/// let escaped = ordair::in_order(&words)
+///     .map(|word| word.len())
+///     .with_iter(|lengths| Ok::<_, ()>(lengths));
+/// ```
+pub struct Iter<'a, R> {
+    consumer: &'a mut Consumer<R>,
+}
+
+/// What the consumer's side of [`with_iter`](InOrder::with_iter) owns, so that
+/// it is cleaned up even if the [`Iter`] borrowing it is forgotten.
+struct Consumer<R> {
+    /// The receivers for the results, in order; `None` once the iterator
+    /// ended or was dropped.
+    results: Option<Receiver<Receiver<R>>>,
+    /// Whether the iterator ended at an item that has no result.
+    gap: bool,
+}
+
+impl<R> Iterator for Iter<'_, R> {
+    type Item = R;
+
+    fn next(&mut self) -> Option<R> {
+        let result = self.consumer.results.as_ref()?.recv().ok().map(|result| result.recv());
+        match result {
+            Some(Ok(result)) => Some(result),
+            ended => {
+                // A result that never came.
+                self.consumer.gap = ended.is_some();
+                self.consumer.results = None;
+                None
+            }
+        }
+    }
+}
+
+impl<R> iter::FusedIterator for Iter<'_, R> {}
+
+impl<R> Drop for Iter<'_, R> {
+    fn drop(&mut self) {
+        self.consumer.results = None;
+    }
+}
+
+impl<R> fmt::Debug for Iter<'_, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Iter").field("ended", &self.consumer.results.is_none()).finish()
     }
 }
 
@@ -371,7 +506,7 @@ fn keep_first<T>(first: &Mutex<Option<T>>, failure: T) {
 }
 
 /// A worker or the consumer panicked, the outer error of
-/// [`try_for_each`](InOrder::try_for_each);
+/// [`try_for_each`](InOrder::try_for_each) and [`with_iter`](InOrder::with_iter);
 /// [`or_unwind`](OrUnwind::or_unwind) resumes it.
 ///
 /// It holds the payload `std::panic::catch_unwind` gives, behind a mutex
@@ -401,7 +536,7 @@ impl Panic {
 }
 
 /// [`or_unwind`](Self::or_unwind), for the result of
-/// [`try_for_each`](InOrder::try_for_each).
+/// [`try_for_each`](InOrder::try_for_each) and [`with_iter`](InOrder::with_iter).
 pub trait OrUnwind<T> {
     /// The value, or the panic resumed on this thread, as if the work had run
     /// there.

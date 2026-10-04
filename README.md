@@ -20,6 +20,25 @@ ordair::in_order(&regions)        // any IntoIterator; borrowing is fine
 
 No per-worker state? Use `.map(process)` instead of `.map_init`.
 
+Want an `Iterator` instead, for `zip`, `take`, a `for` loop with `break`?
+`with_iter` lends one to a closure. It cannot leave the closure, so borrowing,
+the error model and "it never hangs" all still hold:
+
+```rust
+ordair::in_order(&words)
+    .map(|w| w.to_uppercase())
+    .with_iter(|lines| {
+        for line in lines.take(10) {
+            writeln!(out, "{line}")?;
+        }
+        Ok(())
+    })??;
+```
+
+A worker panic or an `init` error ends the iterator early; the real cause comes
+back in the same two-layer result. Dropping the iterator early stops the
+workers, like an error from `consume` does.
+
 ## Why ordair
 
 - **In order by construction.** No indices, no reorder buffer.
@@ -34,10 +53,12 @@ No per-worker state? Use `.map(process)` instead of `.map_init`.
 
 ## Errors
 
-`try_for_each` returns `Result<Result<(), E>, Panic>`:
+`try_for_each` returns `Result<Result<(), E>, Panic>`, `with_iter`
+`Result<Result<T, E>, Panic>`:
 
 - **The inner error is yours,** from `init` or `consume`, untouched. An
-  `eyre::Report` keeps its backtrace and span trace.
+  `eyre::Report` keeps its backtrace and span trace. For `with_iter`, `consume`
+  is the closure.
 - **The outer error is a panic,** in a worker or in `consume`. It is
   `Send + Sync`, so `?` turns it into an `anyhow` or `eyre` error. To panic
   instead, call `.or_unwind()`.

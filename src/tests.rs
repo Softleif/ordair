@@ -268,3 +268,137 @@ fn the_only_thread_of_its_pool_cannot_call_it() {
 fn the_only_thread_of_the_current_pool_cannot_call_it() {
     pool(1).install(|| in_order(0..1).map(|i| i).try_for_each(|_| Ok::<_, String>(()))).ok();
 }
+
+#[test]
+fn with_iter_returns_what_the_closure_returns() {
+    let words = ["a", "bb", "ccc"];
+    let result = in_order(&words)
+        .pool(&pool(4))
+        .map(|word| word.len())
+        .with_iter(|lengths| Ok::<_, String>(lengths.zip(words).collect::<Vec<_>>()));
+    assert_eq!(result.unwrap().unwrap(), [(1, "a"), (2, "bb"), (3, "ccc")]);
+}
+
+#[test]
+fn stopping_the_iterator_early_stops_the_workers() {
+    let started = AtomicUsize::new(0);
+    let result = in_order(0..10_000)
+        .pool(&pool(4))
+        .window(2)
+        .map(|i| {
+            started.fetch_add(1, Ordering::SeqCst);
+            i
+        })
+        .with_iter(|numbers| Ok::<_, String>(numbers.take_while(|&i| i < 10).sum::<i32>()));
+    assert_eq!(result.unwrap(), Ok(45));
+    assert!(started.load(Ordering::SeqCst) < 100);
+}
+
+#[test]
+fn a_dropped_iterator_stops_the_workers_before_the_closure_returns() {
+    let started = AtomicUsize::new(0);
+    let result = in_order(0..10_000)
+        .pool(&pool(4))
+        .window(2)
+        .map(|i| {
+            started.fetch_add(1, Ordering::SeqCst);
+            i
+        })
+        .with_iter(|mut numbers| {
+            let first = numbers.next();
+            drop(numbers);
+            // Long enough for the workers to stop, not to run through the
+            // items.
+            thread::sleep(Duration::from_millis(50));
+            Ok::<_, String>((first, started.load(Ordering::SeqCst)))
+        });
+    let (first, started_by_then) = result.unwrap().unwrap();
+    assert_eq!(first, Some(0));
+    assert!(started_by_then < 100, "{started_by_then}");
+    assert_eq!(started.load(Ordering::SeqCst), started_by_then);
+}
+
+#[test]
+fn a_forgotten_iterator_does_not_hang() {
+    let (done, finished) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let result = in_order(0..10_000).pool(&pool(4)).window(2).map(|i| i).with_iter(|numbers| {
+            #[allow(clippy::mem_forget, reason = "what this tests")]
+            std::mem::forget(numbers);
+            Ok::<_, String>(())
+        });
+        done.send(result.unwrap()).ok();
+    });
+    assert_eq!(finished.recv_timeout(Duration::from_secs(5)).expect("hung"), Ok(()));
+}
+
+#[test]
+fn an_init_error_ends_the_iterator_and_is_returned() {
+    let attempts = AtomicUsize::new(0);
+    let result = in_order(0..1_000)
+        .pool(&pool(2))
+        .window(4)
+        .map_init(
+            || {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("cannot open the BAM".to_owned())
+                } else {
+                    thread::sleep(Duration::from_millis(10));
+                    Ok(())
+                }
+            },
+            |(), i| i,
+        )
+        // Ends early, and the closure cannot tell.
+        .with_iter(|numbers| Ok(numbers.count()));
+    assert_eq!(result.unwrap(), Err("cannot open the BAM".to_owned()));
+}
+
+#[test]
+fn an_init_error_past_where_the_closure_stopped_is_dropped() {
+    let attempts = AtomicUsize::new(0);
+    let result = in_order(0..2)
+        .pool(&pool(2))
+        .window(4)
+        .map_init(
+            || match attempts.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(()),
+                _ => Err("init failed".to_owned()),
+            },
+            // Long enough for the second worker to take the second item
+            |(), i| {
+                thread::sleep(Duration::from_millis(100 * (1 - i)));
+                i
+            },
+        )
+        .with_iter(|mut numbers| Ok(numbers.next()));
+    assert_eq!(result.unwrap(), Ok(Some(0)));
+}
+
+#[test]
+fn a_worker_panic_ends_the_iterator_and_is_the_outer_error() {
+    let mut consumed = Vec::new();
+    let result = in_order(0..100)
+        .pool(&pool(4))
+        .window(4)
+        .map(|i| {
+            assert_ne!(i, 30, "boom");
+            i
+        })
+        .with_iter(|numbers| {
+            consumed.extend(numbers);
+            Ok::<_, String>(())
+        });
+    assert!(result.unwrap_err().to_string().contains("boom"));
+    assert_eq!(consumed, (0..30).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_panic_in_the_closure_is_the_outer_error() {
+    let result =
+        in_order(0..1_000).pool(&pool(4)).window(4).map(|i| i).with_iter(
+            |mut numbers| -> Result<(), String> { panic!("boom at {:?}", numbers.next()) },
+        );
+    let message = result.unwrap_err().to_string();
+    assert_eq!(message, "The consumer panicked: boom at Some(0)");
+}

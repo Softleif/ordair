@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `with_iter` runs the map and lends a closure an `Iterator` over the results,
+  for `zip`, `take_while`, a `for` loop with `break` or an API that takes
+  `impl Iterator`. The iterator cannot outlive the closure, so borrowing works
+  as before and the call still never hangs, even if the iterator is
+  `mem::forget`ten. A worker panic or an `init` error ends it early and comes
+  back in the same `Result<Result<T, E>, Panic>`; dropping it early stops the
+  workers. `try_for_each` is now a thin wrapper over it.
+
 ## 0.3.0
 
 Breaking: the outer error is now `Panic` instead of `WorkerPanic`, and it is
