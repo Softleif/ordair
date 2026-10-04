@@ -176,10 +176,9 @@ fn run(scenario: &Scenario) -> Outcome {
         if ended {
             record.broke(format!("`next` called again after call {}", call - 1));
         }
-        // The worker taking it can be blocked on queueing it, so a pull
-        // is one ahead of a start.
+        // A worker takes its place in the window before the item.
         let done = record.done.load(Ordering::SeqCst);
-        if call > done + window + 1 {
+        if call > done + window {
             record.broke(format!("item {call} pulled when {done} were consumed"));
         }
         if *next_panics == Some(call) {

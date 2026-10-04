@@ -256,18 +256,35 @@ fn can_be_called_from_a_thread_of_its_pool() {
     assert_eq!(seen, (0..100).collect::<Vec<_>>());
 }
 
+/// The calling thread runs the workers itself while it waits.
 #[test]
-#[should_panic(expected = "only thread of its pool")]
-fn the_only_thread_of_its_pool_cannot_call_it() {
-    let pool = pool(1);
-    pool.install(|| in_order(0..1).pool(&pool).map(|i| i).try_for_each(|_| Ok::<_, String>(())))
-        .ok();
+fn the_only_thread_of_its_pool_can_call_it() {
+    let (done, finished) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let pool = pool(1);
+        let seen = pool.install(|| {
+            in_order(0..100)
+                .pool(&pool)
+                .window(4)
+                .map(|i| i)
+                .with_iter(|results| Ok::<_, String>(results.collect::<Vec<_>>()))
+        });
+        done.send(seen.unwrap().unwrap()).ok();
+    });
+    let seen = finished.recv_timeout(Duration::from_secs(5)).expect("hung");
+    assert_eq!(seen, (0..100).collect::<Vec<_>>());
 }
 
 #[test]
-#[should_panic(expected = "only thread of its pool")]
-fn the_only_thread_of_the_current_pool_cannot_call_it() {
-    pool(1).install(|| in_order(0..1).map(|i| i).try_for_each(|_| Ok::<_, String>(()))).ok();
+fn the_only_thread_of_the_current_pool_can_call_it() {
+    let (done, finished) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let sum = pool(1).install(|| {
+            in_order(0..100).map(|i| i).with_iter(|results| Ok::<_, String>(results.sum::<i32>()))
+        });
+        done.send(sum.unwrap().unwrap()).ok();
+    });
+    assert_eq!(finished.recv_timeout(Duration::from_secs(5)).expect("hung"), 4950);
 }
 
 #[test]

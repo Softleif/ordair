@@ -113,11 +113,17 @@
 //! # How it works
 //!
 //! Each item gets a one-shot channel for its result, and the receiving end is
-//! queued for the consumer *when the item is taken*, in a bounded channel. The
-//! queue is therefore in input order by construction, needs no indices or
-//! reordering, and a worker that would start more than `window` items ahead of
-//! the consumer blocks until the consumer catches up. `gzp` keeps compressed
-//! blocks in order the same way.
+//! queued for the consumer *when the item is taken*. The queue is therefore in
+//! input order by construction and needs no indices or reordering. `gzp` keeps
+//! compressed blocks in order the same way.
+//!
+//! A worker takes a place in the window before it takes an item. When there is
+//! none, it gives its thread back to the pool instead of waiting, and the
+//! consumer spawns a replacement for each result it takes off the queue. So
+//! the workers never hold a thread the consumer may need: `consume` and the
+//! work can use the same pool, with `install`, `join`, a parallel iterator or
+//! another map. A consumer on a thread of the pool runs the pool's jobs while
+//! it waits for a result, as rayon's `join` does.
 
 use rayon_core::ThreadPool;
 use std::{
@@ -125,15 +131,21 @@ use std::{
     fmt, iter,
     panic::{self, AssertUnwindSafe},
     sync::{
-        Mutex, MutexGuard, PoisonError,
-        mpsc::{Receiver, SyncSender, sync_channel},
+        Mutex, MutexGuard, PoisonError, TryLockError,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{
+            Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, channel, sync_channel,
+        },
     },
-    thread,
+    time::Duration,
 };
 
+mod states;
 #[cfg(test)]
 #[allow(clippy::arithmetic_side_effects, reason = "tests")]
 mod tests;
+
+use states::States;
 
 /// Starts a parallel map over `items` whose results are consumed in their
 /// order.
@@ -165,9 +177,10 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
     /// Runs the work on the threads of `pool` instead of the current rayon
     /// pool, for its size, thread names or handlers.
     ///
-    /// Every thread of the pool works on this map until the items run out,
-    /// so other work on the pool waits, and a parallel iterator inside the
-    /// work only gets the threads that have run out of items.
+    /// While there is room in the window, every thread of the pool works on
+    /// this map, so other work on the pool waits for the item a thread is on.
+    /// Once the window is full, the workers give their threads back, so the
+    /// consumer, the work and anything else can use the pool too.
     pub fn pool(self, pool: &ThreadPool) -> InOrder<'_, I, Init, Work> {
         let Self { items, pool: _, window, init, work } = self;
         InOrder { items, pool: Some(pool), window, init, work }
@@ -175,8 +188,7 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
 
     /// Bounds how far the workers run ahead of the consumer: besides the
     /// result the consumer is handling, at most `window` items have been
-    /// started, running or finished and waiting. One more may have been
-    /// taken from the items by a worker waiting for room.
+    /// started, running or finished and waiting.
     ///
     /// A result that is finished but waits behind a slow item still counts,
     /// so memory stays bounded however uneven the items are. To keep every
@@ -246,8 +258,9 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
     /// in the order of the items, and returns once the items run out or
     /// something failed.
     ///
-    /// Calling this from one of the pool's own threads works, but that thread
-    /// consumes instead of working.
+    /// Calling this from one of the pool's own threads works, even from the
+    /// only one: while that thread waits for a result, it runs the pool's
+    /// jobs, the workers included.
     ///
     /// # Errors
     ///
@@ -262,11 +275,6 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
     /// worker's or `init`'s, as it always comes from an earlier item. The
     /// losing one is dropped, as a sequential loop would never have reached
     /// its item; to see it anyway, log it in `init`.
-    ///
-    /// # Panics
-    ///
-    /// When called from the only thread of the pool, which would leave no
-    /// thread to work.
     pub fn try_for_each<S, R, E>(
         self,
         mut consume: impl FnMut(R) -> Result<(), E>,
@@ -327,11 +335,6 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
     ///   it left without a result, even when `f` returned `Ok`. Had `f`
     ///   stopped before that item, it is dropped, as a sequential loop would
     ///   never have reached it.
-    ///
-    /// # Panics
-    ///
-    /// When called from the only thread of the pool, which would leave no
-    /// thread to work.
     pub fn with_iter<S, R, E, T>(
         self,
         f: impl for<'a> FnOnce(Iter<'a, R>) -> Result<T, E>,
@@ -344,45 +347,48 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
         E: Send,
     {
         let Self { items, pool, window, init, work } = self;
-        let (on_a_pool_thread, threads) = match pool {
-            Some(pool) => (pool.current_thread_index().is_some(), pool.current_num_threads()),
-            None => {
-                (rayon_core::current_thread_index().is_some(), rayon_core::current_num_threads())
-            }
-        };
-        assert!(!on_a_pool_thread || threads > 1, "ordair called from the only thread of its pool");
+        let threads =
+            pool.map_or_else(rayon_core::current_num_threads, ThreadPool::current_num_threads);
         let window = window.unwrap_or_else(|| threads.saturating_mul(4));
-        let (pending, results) = sync_channel(window);
-        let queue = Queue::new(items.into_iter(), pending);
-        // The first of each: when several workers fail, they mostly share a
-        // cause.
-        let init_failure = Mutex::new(None);
-        let worker_panic = Mutex::new(None);
+        let (pending, results) = channel();
+        let map = Map {
+            queue: Queue::new(items.into_iter(), pending),
+            gate: Gate::new(window),
+            states: States::new(threads),
+            init,
+            work,
+            // The first of each: when several workers fail, they mostly share
+            // a cause.
+            init_failure: Mutex::new(None),
+            worker_panic: Mutex::new(None),
+        };
 
         let (consumed, gap) = in_place_scope(pool, |scope| {
-            scope.spawn_broadcast(|_, _| {
-                let worked = run_worker(&queue, &init, &work);
-                // However the worker stopped: if every worker panicked in
-                // `init` and none closed the queue, the consumer would wait
-                // forever.
-                queue.close();
-                match worked {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => keep_first(&init_failure, error),
-                    Err(payload) => keep_first(&worker_panic, payload),
+            let spawn_worker = || scope.spawn(|_| map.run_worker());
+            for _ in 0..threads {
+                spawn_worker();
+            }
+            // A worker that found the window full gave its thread back; one
+            // takes its place for each result the consumer takes.
+            let release = || {
+                if map.gate.release() {
+                    spawn_worker();
                 }
-            });
+            };
 
             // `f` only borrows this, so the receiver is dropped here whatever
             // `f` did with the iterator, `mem::forget` included.
             let mut consumer = Consumer { results: Some(results), gap: false };
-            let consumed =
-                panic::catch_unwind(AssertUnwindSafe(|| f(Iter { consumer: &mut consumer })));
-            // Workers blocked on queueing a result wake up to a disconnected
-            // channel and stop.
+            let consumed = panic::catch_unwind(AssertUnwindSafe(|| {
+                f(Iter { consumer: &mut consumer, release: &release })
+            }));
+            // Workers queueing a result find a disconnected channel and stop.
             consumer.results = None;
             (consumed, consumer.gap)
         });
+        // Each state on its own thread, as it need not be `Send`.
+        map.drop_states(pool);
+        let Map { init_failure, worker_panic, .. } = map;
 
         let consumed = consumed.map_err(|payload| Panic::new(payload, true))?;
         if let Some(payload) = worker_panic.into_inner().unwrap_or_else(PoisonError::into_inner) {
@@ -420,6 +426,9 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
 /// ```
 pub struct Iter<'a, R> {
     consumer: &'a mut Consumer<R>,
+    /// Called for each result taken off the queue, which frees its place in
+    /// the window.
+    release: &'a (dyn Fn() + Sync + 'a),
 }
 
 /// What the consumer's side of [`with_iter`](InOrder::with_iter) owns, so that
@@ -436,9 +445,12 @@ impl<R> Iterator for Iter<'_, R> {
     type Item = R;
 
     fn next(&mut self) -> Option<R> {
-        let result = self.consumer.results.as_ref()?.recv().ok().map(|result| result.recv());
-        match result {
-            Some(Ok(result)) => Some(result),
+        let next = wait(self.consumer.results.as_ref()?);
+        if next.is_some() {
+            (self.release)();
+        }
+        match next.map(|result| wait(&result)) {
+            Some(Some(result)) => Some(result),
             ended => {
                 // A result that never came.
                 self.consumer.gap = ended.is_some();
@@ -450,6 +462,39 @@ impl<R> Iterator for Iter<'_, R> {
 }
 
 impl<R> iter::FusedIterator for Iter<'_, R> {}
+
+/// Receives from `channel`, or `None` once it is disconnected.
+///
+/// On a thread of a rayon pool, it runs the pool's other jobs while it
+/// waits, as rayon's own `join` does: the workers of this very map, if the
+/// consumer is one of the threads they need, or work it is holding up, such
+/// as a `broadcast` from the work. Workers never wait for the consumer, so
+/// none of them can hold it up for long. Rayon cannot wake a thread for a new
+/// job, so it looks again after at most a millisecond.
+fn wait<T>(channel: &Receiver<T>) -> Option<T> {
+    if rayon_core::current_thread_index().is_none() {
+        return channel.recv().ok();
+    }
+    let mut pause = Duration::from_micros(1);
+    loop {
+        match channel.try_recv() {
+            Ok(value) => return Some(value),
+            Err(TryRecvError::Disconnected) => return None,
+            Err(TryRecvError::Empty) => {}
+        }
+        if rayon_core::yield_now() == Some(rayon_core::Yield::Executed) {
+            pause = Duration::from_micros(1);
+            continue;
+        }
+        match channel.recv_timeout(pause) {
+            Ok(value) => return Some(value),
+            Err(RecvTimeoutError::Disconnected) => return None,
+            Err(RecvTimeoutError::Timeout) => {
+                pause = pause.saturating_mul(2).min(Duration::from_millis(1))
+            }
+        }
+    }
+}
 
 impl<R> Drop for Iter<'_, R> {
     fn drop(&mut self) {
@@ -474,26 +519,104 @@ fn in_place_scope<'scope, R>(
     }
 }
 
-/// Takes items until there are none left or the consumer is gone. The outer
-/// error is a panic.
-fn run_worker<I: Iterator, S, R, E>(
-    queue: &Queue<I, R>,
-    init: &impl Fn() -> Result<S, E>,
-    work: &impl Fn(&mut S, I::Item) -> R,
-) -> thread::Result<Result<(), E>> {
-    panic::catch_unwind(AssertUnwindSafe(|| {
-        let Some(first) = queue.take() else { return Ok(()) };
-        // If this fails, the first item is dropped unanswered, which is where
-        // the consumer stops.
-        let mut state = init()?;
-        for (item, place) in iter::once(first).chain(iter::from_fn(|| queue.take())) {
-            if place.send(work(&mut state, item)).is_err() {
-                // The consumer stopped, so this result is not needed.
-                break;
+/// What the workers of one call share.
+struct Map<I: Iterator, S, R, E, Init, Work> {
+    queue: Queue<I, R>,
+    gate: Gate,
+    states: States<S>,
+    init: Init,
+    work: Work,
+    init_failure: Mutex<Option<E>>,
+    worker_panic: Mutex<Option<Box<dyn Any + Send>>>,
+}
+
+/// Why a worker stopped without failing.
+enum Stopped {
+    /// It gave its thread back, to be replaced when there is room.
+    Parked,
+    /// There is nothing more to take.
+    Done,
+}
+
+impl<I, S, R, E, Init, Work> Map<I, S, R, E, Init, Work>
+where
+    I: Iterator,
+    Init: Fn() -> Result<S, E>,
+    Work: Fn(&mut S, I::Item) -> R,
+{
+    /// A worker: takes items while there is room in the window and returns
+    /// once there is none, or nothing left to take. It never waits for the
+    /// consumer, so the consumer can use the pool too.
+    fn run_worker(&self) {
+        // `None` on a thread that is already working on this map further up
+        // its stack, having stolen this job while waiting in `work`: that
+        // thread's state is in use. The worker below still has an item in
+        // flight, whose result will spawn a replacement.
+        let Some(mut state) = self.states.claim() else {
+            self.gate.park();
+            return;
+        };
+        let worked =
+            panic::catch_unwind(AssertUnwindSafe(|| self.take_items(state.get(), &self.states)));
+        drop(state);
+        match worked {
+            Ok(Ok(Stopped::Parked | Stopped::Done)) => {}
+            // If every worker failed and none closed the queue, the consumer
+            // would wait forever.
+            Ok(Err(error)) => {
+                self.queue.close();
+                keep_first(&self.init_failure, error);
+            }
+            Err(payload) => {
+                self.queue.close();
+                keep_first(&self.worker_panic, payload);
             }
         }
-        Ok(())
-    }))
+    }
+
+    fn take_items(&self, state: &mut Option<S>, states: &States<S>) -> Result<Stopped, E> {
+        loop {
+            if !self.gate.enter() {
+                return Ok(Stopped::Parked);
+            }
+            let (item, place) = match self.queue.take() {
+                Take::Item(item) => item,
+                Take::Busy => {
+                    self.gate.leave_and_park();
+                    return Ok(Stopped::Parked);
+                }
+                Take::Done => return Ok(Stopped::Done),
+            };
+            let state = match state {
+                Some(state) => state,
+                // If this fails, the item is dropped unanswered, which is
+                // where the consumer stops.
+                None => states.built(state.insert((self.init)()?)),
+            };
+            if place.send((self.work)(state, item)).is_err() {
+                // The consumer stopped, so this result is not needed.
+                self.queue.close();
+                return Ok(Stopped::Done);
+            }
+        }
+    }
+
+    /// Drops the state of every thread that built one, on that thread.
+    fn drop_states(&self, pool: Option<&ThreadPool>) {
+        if !self.states.any_built() {
+            return;
+        }
+        let (states, worker_panic) = (&self.states, &self.worker_panic);
+        let drop_mine = |_: rayon_core::BroadcastContext<'_>| {
+            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| states.drop_mine())) {
+                keep_first(worker_panic, payload);
+            }
+        };
+        match pool {
+            Some(pool) => pool.broadcast(drop_mine),
+            None => rayon_core::broadcast(drop_mine),
+        };
+    }
 }
 
 /// The payload of the [`Panic`] for a result that went missing although
@@ -580,46 +703,154 @@ fn message(panic: &(dyn Any + Send)) -> &str {
         .unwrap_or("no message")
 }
 
+/// The room left in the window, and how many workers gave their thread
+/// back for want of it.
+struct Gate(Mutex<Room>);
+
+struct Room {
+    free: usize,
+    parked: usize,
+}
+
+impl Gate {
+    fn new(window: usize) -> Self {
+        Self(Mutex::new(Room { free: window, parked: 0 }))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Room> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes a place in the window for an item, or, when there is none,
+    /// parks the worker asking.
+    fn enter(&self) -> bool {
+        let mut room = self.lock();
+        if let Some(free) = room.free.checked_sub(1) {
+            room.free = free;
+            true
+        } else {
+            room.parked = room.parked.saturating_add(1);
+            false
+        }
+    }
+
+    /// Parks a worker that holds no place in the window.
+    fn park(&self) {
+        let mut room = self.lock();
+        room.parked = room.parked.saturating_add(1);
+    }
+
+    /// Gives back the place a worker took, and parks it.
+    fn leave_and_park(&self) {
+        let mut room = self.lock();
+        room.free = room.free.saturating_add(1);
+        room.parked = room.parked.saturating_add(1);
+    }
+
+    /// Frees the place of a result the consumer took. True when a parked
+    /// worker should be spawned to take it.
+    fn release(&self) -> bool {
+        let mut room = self.lock();
+        room.free = room.free.saturating_add(1);
+        let Some(parked) = room.parked.checked_sub(1) else { return false };
+        room.parked = parked;
+        true
+    }
+}
+
+/// Marks the thread holding the [`Queue`]'s items until dropped, unwinding
+/// included.
+struct Holding<'a>(&'a AtomicUsize);
+
+impl<'a> Holding<'a> {
+    fn new(holder: &'a AtomicUsize, me: usize) -> Self {
+        holder.store(me, Ordering::SeqCst);
+        Self(holder)
+    }
+}
+
+impl Drop for Holding<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+}
+
+/// What a worker got from the [`Queue`].
+enum Take<T> {
+    Item(T),
+    /// A worker further up this thread's stack is taking an item, so waiting
+    /// for it would never end.
+    Busy,
+    /// There is nothing more to take.
+    Done,
+}
+
 /// The items not taken yet, and where the receivers for their results go.
 /// `None` once closed.
-struct Queue<I: Iterator, R>(Mutex<Option<(I, SyncSender<Receiver<R>>)>>);
+struct Queue<I: Iterator, R> {
+    items: Mutex<Option<(I, Sender<Receiver<R>>)>>,
+    /// One more than the index of the thread holding `items`, else zero.
+    holder: AtomicUsize,
+}
 
 impl<I: Iterator, R> Queue<I, R> {
-    fn new(items: I, pending: SyncSender<Receiver<R>>) -> Self {
-        Self(Mutex::new(Some((items, pending))))
+    fn new(items: I, pending: Sender<Receiver<R>>) -> Self {
+        Self { items: Mutex::new(Some((items, pending))), holder: AtomicUsize::new(0) }
     }
 
     /// Takes the next item and queues the receiver for its result in the same
     /// critical section, which is what keeps the queue in input order.
-    /// Blocking here while the queue is full is the back-pressure.
     ///
     /// Once there is nothing more to take, for whatever reason, the queue is
     /// closed so that the consumer sees the end of its results.
-    fn take(&self) -> Option<(I::Item, SyncSender<R>)> {
-        let mut queue = self.lock();
+    fn take(&self) -> Take<(I::Item, SyncSender<R>)> {
+        // One more than this thread's index; a worker always runs on one.
+        let me = rayon_core::current_thread_index().map_or(0, |index| index.saturating_add(1));
+        let mut queue = match self.items.try_lock() {
+            Ok(queue) => queue,
+            Err(TryLockError::Poisoned(poisoned)) => Self::closed(poisoned.into_inner()),
+            // Its holder, if it is this thread, is further up the stack, in
+            // the items' `next`, and has stolen this worker while waiting
+            // there. The holder only ever sets it to its own index, and resets
+            // it before letting go, so this cannot see this thread by mistake.
+            Err(TryLockError::WouldBlock)
+                if me != 0 && self.holder.load(Ordering::SeqCst) == me =>
+            {
+                return Take::Busy;
+            }
+            Err(TryLockError::WouldBlock) => self.lock(),
+        };
+        let holding = Holding::new(&self.holder, me);
         let next = queue.as_mut().and_then(|(items, pending)| {
             let item = items.next()?;
             let (place, result) = sync_channel(1);
             pending.send(result).ok()?;
             Some((item, place))
         });
-        if next.is_none() {
-            *queue = None;
+        drop(holding);
+        match next {
+            Some(next) => Take::Item(next),
+            None => {
+                *queue = None;
+                Take::Done
+            }
         }
-        next
     }
 
     fn close(&self) {
         *self.lock() = None;
     }
 
+    fn lock(&self) -> MutexGuard<'_, Option<(I, Sender<Receiver<R>>)>> {
+        self.items.lock().unwrap_or_else(|poisoned| Self::closed(poisoned.into_inner()))
+    }
+
     /// A panic while holding the lock leaves the iterator in an unknown state,
     /// so a poisoned queue is a closed one.
-    fn lock(&self) -> MutexGuard<'_, Option<(I, SyncSender<Receiver<R>>)>> {
-        self.0.lock().unwrap_or_else(|poisoned| {
-            let mut queue = poisoned.into_inner();
-            *queue = None;
-            queue
-        })
+    fn closed(
+        mut queue: MutexGuard<'_, Option<(I, Sender<Receiver<R>>)>>,
+    ) -> MutexGuard<'_, Option<(I, Sender<Receiver<R>>)>> {
+        *queue = None;
+        queue
     }
 }
