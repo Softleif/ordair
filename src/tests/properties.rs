@@ -19,6 +19,24 @@ enum Failure {
     Panic,
 }
 
+/// How the closure of `with_iter` leaves the iterator when it stops early.
+#[derive(Debug, Clone, Copy)]
+enum Stop {
+    Return,
+    /// Drops it, then takes its time before returning.
+    Drop,
+    Forget,
+}
+
+/// How the results are consumed.
+#[derive(Debug, Clone, Copy)]
+enum Api {
+    TryForEach,
+    /// A `for` loop over `with_iter`'s iterator, which stops once that many
+    /// items are consumed, if it gets that far.
+    WithIter(Option<(usize, Stop)>),
+}
+
 #[derive(Debug, Clone)]
 struct Item {
     work_us: u64,
@@ -38,6 +56,7 @@ struct Scenario {
     /// The n-th call to the iterator's `next` panics; `items.len()` is
     /// the call that would have ended it.
     next_panics: Option<usize>,
+    api: Api,
 }
 
 fn below(n: usize) -> impl Generator<usize> {
@@ -84,7 +103,16 @@ fn scenario(tc: &TestCase) -> Scenario {
         .then(|| (tc.draw_silent(below(len)), tc.draw_silent(failure())));
     let next_panics =
         tc.draw_silent(gs::weighted_booleans(0.1)).then(|| tc.draw_silent(below(len + 1)));
-    Scenario { threads, window, items, init_fails, consume_fails, next_panics }
+    let api = if tc.draw_silent(gs::booleans()) {
+        Api::TryForEach
+    } else {
+        let stop = tc.draw_silent(gs::weighted_booleans(0.5)).then(|| {
+            let how = tc.draw_silent(gs::sampled_from(&[Stop::Return, Stop::Drop, Stop::Forget]));
+            (tc.draw_silent(below(len + 1)), how)
+        });
+        Api::WithIter(stop)
+    };
+    Scenario { threads, window, items, init_fails, consume_fails, next_panics, api }
 }
 
 /// Counts live values, so a result or state that is never dropped
@@ -117,6 +145,8 @@ struct Record {
     init_failed: AtomicBool,
     consume_failed: AtomicBool,
     consume_panicked: AtomicBool,
+    /// `with_iter`'s closure stopped before the iterator ended.
+    stopped: AtomicBool,
     broken: Mutex<Vec<String>>,
 }
 
@@ -134,7 +164,7 @@ struct Outcome {
 }
 
 fn run(scenario: &Scenario) -> Outcome {
-    let Scenario { threads, window, items, init_fails, consume_fails, next_panics } = scenario;
+    let Scenario { threads, window, items, init_fails, consume_fails, next_panics, api } = scenario;
     let record = Record::default();
     let mut consumed = Vec::new();
 
@@ -146,10 +176,9 @@ fn run(scenario: &Scenario) -> Outcome {
         if ended {
             record.broke(format!("`next` called again after call {}", call - 1));
         }
-        // The worker taking it can be blocked on queueing it, so a pull
-        // is one ahead of a start.
+        // A worker takes its place in the window before the item.
         let done = record.done.load(Ordering::SeqCst);
-        if call > done + window + 1 {
+        if call > done + window {
             record.broke(format!("item {call} pulled when {done} were consumed"));
         }
         if *next_panics == Some(call) {
@@ -165,58 +194,78 @@ fn run(scenario: &Scenario) -> Outcome {
         item.map(|item| (call, item))
     });
 
+    let mut consume = |(index, consume_us, _result): (usize, u64, Tracked<'_>)| {
+        match consume_fails {
+            Some((n, Failure::Error)) if *n == consumed.len() => {
+                record.consume_failed.store(true, Ordering::SeqCst);
+                return Err("consume failed".to_owned());
+            }
+            Some((n, Failure::Panic)) if *n == consumed.len() => {
+                record.consume_panicked.store(true, Ordering::SeqCst);
+                panic!("consume panicked");
+            }
+            _ => {}
+        }
+        thread::sleep(Duration::from_micros(consume_us));
+        consumed.push(index);
+        record.done.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    };
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        in_order(source)
-            .pool(&pool(*threads))
-            .window(*window)
-            .map_init(
-                || {
-                    let nth = record.inits.fetch_add(1, Ordering::SeqCst);
-                    match init_fails {
-                        Some((n, Failure::Error)) if *n == nth => {
-                            record.init_failed.store(true, Ordering::SeqCst);
-                            Err("init failed".to_owned())
-                        }
-                        Some((n, Failure::Panic)) if *n == nth => {
-                            record.worker_panicked.store(true, Ordering::SeqCst);
-                            panic!("init panicked")
-                        }
-                        _ => Ok((thread::current().id(), Tracked::new(&record.live))),
+        let pool = pool(*threads);
+        let map = in_order(source).pool(&pool).window(*window).map_init(
+            || {
+                let nth = record.inits.fetch_add(1, Ordering::SeqCst);
+                match init_fails {
+                    Some((n, Failure::Error)) if *n == nth => {
+                        record.init_failed.store(true, Ordering::SeqCst);
+                        Err("init failed".to_owned())
                     }
-                },
-                |(built_on, _), (index, item): (usize, &Item)| {
-                    if *built_on != thread::current().id() {
-                        record.broke(format!("the state for item {index} moved threads"));
-                    }
-                    let done = record.done.load(Ordering::SeqCst);
-                    if index > done + window {
-                        record.broke(format!("item {index} started when {done} were consumed"));
-                    }
-                    thread::sleep(Duration::from_micros(item.work_us));
-                    if item.panics {
+                    Some((n, Failure::Panic)) if *n == nth => {
                         record.worker_panicked.store(true, Ordering::SeqCst);
-                        panic!("item {index} panicked");
+                        panic!("init panicked")
                     }
-                    (index, item.consume_us, Tracked::new(&record.live))
-                },
-            )
-            .try_for_each(|(index, consume_us, _result): (usize, u64, Tracked<'_>)| {
-                match consume_fails {
-                    Some((n, Failure::Error)) if *n == consumed.len() => {
-                        record.consume_failed.store(true, Ordering::SeqCst);
-                        return Err("consume failed".to_owned());
-                    }
-                    Some((n, Failure::Panic)) if *n == consumed.len() => {
-                        record.consume_panicked.store(true, Ordering::SeqCst);
-                        panic!("consume panicked");
-                    }
-                    _ => {}
+                    _ => Ok((thread::current().id(), Tracked::new(&record.live))),
                 }
-                thread::sleep(Duration::from_micros(consume_us));
-                consumed.push(index);
-                record.done.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            })
+            },
+            |(built_on, _), (index, item): (usize, &Item)| {
+                if *built_on != thread::current().id() {
+                    record.broke(format!("the state for item {index} moved threads"));
+                }
+                let done = record.done.load(Ordering::SeqCst);
+                if index > done + window {
+                    record.broke(format!("item {index} started when {done} were consumed"));
+                }
+                thread::sleep(Duration::from_micros(item.work_us));
+                if item.panics {
+                    record.worker_panicked.store(true, Ordering::SeqCst);
+                    panic!("item {index} panicked");
+                }
+                (index, item.consume_us, Tracked::new(&record.live))
+            },
+        );
+        let Api::WithIter(stop) = api else { return map.try_for_each(consume) };
+        map.with_iter(|mut results| {
+            loop {
+                if let Some((k, how)) = stop
+                    && record.done.load(Ordering::SeqCst) == *k
+                {
+                    record.stopped.store(true, Ordering::SeqCst);
+                    match how {
+                        Stop::Return => {}
+                        Stop::Drop => {
+                            drop(results);
+                            thread::sleep(Duration::from_micros(200));
+                        }
+                        #[allow(clippy::mem_forget, reason = "what this tests")]
+                        Stop::Forget => std::mem::forget(results),
+                    }
+                    return Ok(());
+                }
+                let Some(result) = results.next() else { return Ok(()) };
+                consume(result)?;
+            }
+        })
     }));
     Outcome { result, consumed, record }
 }
@@ -245,13 +294,18 @@ fn check(scenario: &Scenario) {
     let Some(Outcome { result, consumed, record }) = run_with_deadline(scenario) else {
         panic!("hung")
     };
-    let Scenario { threads, items, init_fails, consume_fails, next_panics, .. } = scenario;
+    let Scenario { threads, items, init_fails, consume_fails, next_panics, api, .. } = scenario;
+    let stop = match api {
+        Api::WithIter(Some((k, _))) => Some(*k),
+        _ => None,
+    };
     let n = items.len();
     let pulled = record.pulled.into_inner();
     let worker_panicked = record.worker_panicked.into_inner();
     let init_failed = record.init_failed.into_inner();
     let consume_failed = record.consume_failed.into_inner();
     let consume_panicked = record.consume_panicked.into_inner();
+    let stopped = record.stopped.into_inner();
 
     // Whatever happens: every promise kept along the way, an in-order
     // prefix, nothing leaked, and no worker built its state twice.
@@ -261,12 +315,13 @@ fn check(scenario: &Scenario) {
     assert!(record.inits.into_inner() <= *threads, "`init` called more than once per worker");
     let first_panic = items.iter().position(|item| item.panics);
     let consume_fails = consume_fails.map(|(f, _)| f);
-    let limit = [first_panic, consume_fails, *next_panics].into_iter().flatten().min();
+    let limit = [first_panic, consume_fails, *next_panics, stop].into_iter().flatten().min();
     assert!(consumed.len() <= limit.unwrap_or(n).min(n));
 
     // Nothing unwinds out of the call. A panic in `consume` wins, as it
     // comes from an earlier item than any worker's, then a worker panic,
-    // then the consumer's error, then a failed `init`'s.
+    // then the consumer's error, then a failed `init`'s, but only if the
+    // results got as far as the item it lost.
     let worker_failed = worker_panicked || init_failed;
     match &result {
         Err(payload) => panic!("unwound with {:?}", message(&**payload)),
@@ -276,27 +331,39 @@ fn check(scenario: &Scenario) {
         Ok(_) if consume_panicked => panic!("a panic in `consume` went unreported"),
         Ok(Err(panic)) => assert!(worker_panicked, "returned {panic:?}"),
         Ok(Ok(_)) if worker_panicked => panic!("a worker panic went unreported"),
+        Ok(Ok(Ok(()))) if stopped => {
+            assert!(!consume_failed, "a failure went unreported");
+            assert_eq!(Some(consumed.len()), stop);
+        }
         Ok(Ok(Ok(()))) => {
             assert!(!init_failed && !consume_failed, "a failure went unreported");
             assert_eq!(consumed.len(), n);
         }
         Ok(Ok(Err(error))) if consume_failed => assert_eq!(error, "consume failed"),
         Ok(Ok(Err(error))) => {
-            assert!(init_failed, "returned {error:?}");
+            assert!(init_failed && !stopped, "returned {error:?}");
             assert_eq!(error, "init failed");
         }
     }
 
-    // With a single failure, there is only one right outcome.
+    // With a single failure, there is only one right outcome; stopping
+    // early only cuts it short.
+    let upto = |end: usize| end.min(stop.unwrap_or(n));
     match (init_fails, first_panic, consume_fails, next_panics) {
-        (None, Some(p), None, None) => assert_eq!(consumed.len(), p),
-        (None, None, Some(f), None) => assert_eq!(consumed.len(), f),
-        (None, None, None, Some(k)) => assert_eq!((consumed.len(), pulled), (*k, *k)),
+        (None, None, None, None) => assert_eq!(consumed.len(), upto(n)),
+        (None, Some(p), None, None) => assert_eq!(consumed.len(), upto(p)),
+        (None, None, Some(f), None) => assert_eq!(consumed.len(), upto(f)),
+        (None, None, None, Some(k)) if stop.is_none() => {
+            assert_eq!((consumed.len(), pulled), (*k, *k));
+        }
+        (None, None, None, Some(k)) => assert_eq!(consumed.len(), upto(*k)),
         // `init` runs on a worker's first item, which is lost when it
-        // fails, so the results stop before it
-        (Some(_), None, None, None) if worker_failed => assert!(consumed.len() < pulled),
+        // fails, so the results stop before it, unless they stopped first
+        (Some(_), None, None, None) if worker_failed && !stopped => {
+            assert!(consumed.len() < pulled);
+        }
         // The failing call never came: fewer workers got an item
-        (Some(_), None, None, None) => assert_eq!(consumed.len(), n),
+        (Some(_), None, None, None) if !worker_failed => assert_eq!(consumed.len(), upto(n)),
         _ => {}
     }
 }
@@ -319,5 +386,6 @@ fn the_only_worker_panicking_does_not_hang() {
         init_fails: None,
         consume_fails: None,
         next_panics: Some(0),
+        api: Api::TryForEach,
     });
 }

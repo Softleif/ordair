@@ -20,6 +20,25 @@ ordair::in_order(&regions)        // any IntoIterator; borrowing is fine
 
 No per-worker state? Use `.map(process)` instead of `.map_init`.
 
+Want an `Iterator` instead, for `zip`, `take`, a `for` loop with `break`?
+`with_iter` lends one to a closure. It cannot leave the closure, so borrowing,
+the error model and "it never hangs" all still hold:
+
+```rust
+ordair::in_order(&words)
+    .map(|w| w.to_uppercase())
+    .with_iter(|lines| {
+        for line in lines.take(10) {
+            writeln!(out, "{line}")?;
+        }
+        Ok(())
+    })??;
+```
+
+A worker panic or an `init` error ends the iterator early; the real cause comes
+back in the same two-layer result. Dropping the iterator early stops the
+workers, like an error from `consume` does.
+
 ## Why ordair
 
 - **In order by construction.** No indices, no reorder buffer.
@@ -28,16 +47,25 @@ No per-worker state? Use `.map(process)` instead of `.map_init`.
   such results pile up.
 - **Per-worker state.** Built on the worker's own thread when it takes its
   first item. It need not be `Send` or `Clone`, and building it may fail.
-- **Your pool.** Or the current one. Calling it from one of the pool's own
-  threads works too.
+- **Your pool, shared.** Or the current one. Workers never wait for the
+  consumer: when they run out of items to start, they give their threads back.
+  So the items, the work and `consume` can all use the same pool: `install`,
+  `join`, `broadcast`, a parallel iterator, a library that uses rayon inside,
+  another map. Calling it from one of the pool's own threads works too, even
+  the only one, and so does chaining maps on one pool.
+- **Items need not be `Send`.** They are taken on the calling thread, as the
+  window has room. A slow iterator slows the consumer, so put expensive work in
+  `map`.
 - **One dependency:** `rayon-core`, the pool half of `rayon`.
 
 ## Errors
 
-`try_for_each` returns `Result<Result<(), E>, Panic>`:
+`try_for_each` returns `Result<Result<(), E>, Panic>`, `with_iter`
+`Result<Result<T, E>, Panic>`:
 
 - **The inner error is yours,** from `init` or `consume`, untouched. An
-  `eyre::Report` keeps its backtrace and span trace.
+  `eyre::Report` keeps its backtrace and span trace. For `with_iter`, `consume`
+  is the closure.
 - **The outer error is a panic,** in a worker or in `consume`. It is
   `Send + Sync`, so `?` turns it into an `anyhow` or `eyre` error. To panic
   instead, call `.or_unwind()`.
@@ -51,10 +79,16 @@ with `anyhow` or `eyre`; with concrete types, one of them may need a `map_err`.
 
 ## How it works
 
-Each item gets a one-shot channel for its result. The receiving end is queued
-for the consumer when the item is taken, in a bounded queue. So the queue is
-in input order, and a worker that would get more than `window` items ahead
-blocks until the consumer catches up.
+The consumer takes the items, on the calling thread, while the window has room.
+Each item gets a one-shot channel for its result; the consumer keeps the
+receiving ends in a queue, so the results come out in input order.
+
+Workers take the items the consumer took. When there are none left, a worker
+returns its thread to the pool, and the consumer starts a new one when it takes
+more. A worker that leaves items behind starts another, up to one per thread.
+The state `init` builds stays behind on its thread for whichever worker runs
+there next, and is dropped there at the end. A consumer on a thread of the pool
+runs the pool's jobs while it waits, as rayon's `join` does.
 
 ## Alternatives
 
