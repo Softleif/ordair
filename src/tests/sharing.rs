@@ -1,19 +1,26 @@
-//! The map shares its pool: the consumer and the work may use it too,
-//! whatever the pool's size, the window or where the call is made from.
+//! The map shares its pool: the items, the work and the consumer may all
+//! use it too, and maps may be chained on it, whatever the pool's size, the
+//! window, or where the call is made from.
 //!
 //! "It never hangs" is the contract under test; a hang is caught by
-//! running every case on its own thread with a deadline.
+//! running every case on its own thread with a deadline. A case that hangs
+//! leaves its threads behind, which only costs memory.
 
 use super::*;
 use hegel::{Generator, TestCase, generators as gs};
 use std::{
     cell::Cell,
+    collections::HashMap,
     panic::{self, AssertUnwindSafe},
-    sync::{Mutex, atomic::AtomicIsize, mpsc},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicIsize},
+        mpsc,
+    },
     thread::ThreadId,
 };
 
-/// Something done with the map's pool, from the consumer or the work.
+/// Something done with the map's pool.
 #[derive(Debug, Clone, Copy)]
 enum Use {
     Nothing,
@@ -23,8 +30,8 @@ enum Use {
     Join(u64),
     /// Run a closure on every thread of the pool.
     Broadcast,
-    /// Another map on the same pool, over `0..len`, consuming the first
-    /// `take` results if given, else all.
+    /// Another map on the same pool, over `0..len`, with a state that needs
+    /// dropping, consuming the first `take` results if given, else all.
     Nested {
         len: usize,
         window: usize,
@@ -35,10 +42,34 @@ enum Use {
 /// Where the map is called from.
 #[derive(Debug, Clone, Copy)]
 enum Caller {
-    /// A thread outside the pool, with `.pool(&pool)`.
+    /// A thread outside any pool, with `.pool(&pool)`.
     Outside,
     /// One of the pool's own threads, with the current pool.
     Inside,
+    /// A thread of another pool of that many threads, with `.pool(&pool)`.
+    OtherPool(usize),
+    /// A thread outside any pool, on the global pool.
+    Global,
+}
+
+/// The one thing that goes wrong, if any.
+#[derive(Debug, Clone, Copy)]
+enum Failure {
+    /// The work panics on that item.
+    WorkPanics(usize),
+    /// The n-th call to `init`, in time, fails.
+    InitFails(usize),
+    /// The consumer stops after that many results.
+    Stops(usize),
+}
+
+#[derive(Debug, Clone)]
+struct Item {
+    work_us: u64,
+    /// Done with the pool by the items iterator, the work and the consumer.
+    by_items: Use,
+    by_work: Use,
+    by_consumer: Use,
 }
 
 #[derive(Debug, Clone)]
@@ -46,10 +77,20 @@ struct Scenario {
     threads: usize,
     window: usize,
     caller: Caller,
-    /// For each item: how long the work takes, what it does with the pool,
-    /// and what the consumer does with it.
-    items: Vec<(u64, Use, Use)>,
+    items: Vec<Item>,
+    failure: Option<Failure>,
 }
+
+/// Which of the three use the pool in a property.
+#[derive(Clone, Copy)]
+struct Users {
+    items: bool,
+    work: bool,
+    consumer: bool,
+}
+
+const ALL: Users = Users { items: true, work: true, consumer: true };
+const NONE: Users = Users { items: false, work: false, consumer: false };
 
 fn below(n: usize) -> impl Generator<usize> {
     gs::integers::<usize>().max_value(n - 1)
@@ -79,50 +120,81 @@ fn latency(tc: &TestCase) -> u64 {
     }
 }
 
-/// `consumer_uses` and `work_uses` say whether each side draws uses of
-/// the pool, so that each property can fail on its own side alone.
-fn scenario(work_uses: bool, consumer_uses: bool) -> impl Generator<Scenario> {
+#[hegel::composite]
+fn caller(tc: &TestCase) -> Caller {
+    match tc.draw_silent(below(4)) {
+        0 => Caller::Outside,
+        1 => Caller::Inside,
+        2 => Caller::OtherPool(tc.draw_silent(below(3)) + 1),
+        _ => Caller::Global,
+    }
+}
+
+fn scenario(users: Users, failures: bool) -> impl Generator<Scenario> {
     hegel::compose!(|tc| {
         let threads = tc.draw_silent(gs::integers::<usize>().min_value(1).max_value(6));
         let window = tc.draw_silent(gs::integers::<usize>().min_value(1).max_value(8));
-        let caller = if tc.draw_silent(gs::booleans()) { Caller::Inside } else { Caller::Outside };
+        let caller = tc.draw_silent(caller());
         // Long enough for the window to fill.
         let len = tc.draw_silent(below(40));
+        let use_if = |uses| if uses { tc.draw_silent(pool_use()) } else { Use::Nothing };
         let items = (0..len)
-            .map(|_| {
-                let work = if work_uses { tc.draw_silent(pool_use()) } else { Use::Nothing };
-                let consume = if consumer_uses { tc.draw_silent(pool_use()) } else { Use::Nothing };
-                (tc.draw_silent(latency()), work, consume)
+            .map(|_| Item {
+                by_items: use_if(users.items),
+                by_work: use_if(users.work),
+                by_consumer: use_if(users.consumer),
+                work_us: tc.draw_silent(latency()),
             })
             .collect();
-        Scenario { threads, window, caller, items }
+        let failure = (failures && len > 0).then(|| match tc.draw_silent(below(3)) {
+            0 => Failure::WorkPanics(tc.draw_silent(below(len))),
+            1 => Failure::InitFails(tc.draw_silent(below(threads))),
+            _ => Failure::Stops(tc.draw_silent(below(len))),
+        });
+        Scenario { threads, window, caller, items, failure }
     })
+}
+
+/// The pool a use goes to: the map's, or the current one, which is the
+/// global pool outside any.
+#[derive(Clone, Copy)]
+enum Target<'a> {
+    Pool(&'a ThreadPool),
+    Current,
 }
 
 /// Uses the pool as `what` says and returns a value to check: the sum of
 /// the results consumed from a nested map, else zero.
-fn use_pool(pool: &ThreadPool, caller: Caller, what: Use) -> usize {
-    match what {
-        Use::Nothing => 0,
-        Use::Install => pool.install(|| 0),
-        Use::Join(us) => {
-            let sleep = || thread::sleep(Duration::from_micros(us));
-            pool.install(|| rayon_core::join(sleep, sleep));
+fn use_pool(target: Target<'_>, what: Use) -> usize {
+    let sleep = |us| move || thread::sleep(Duration::from_micros(us));
+    match (what, target) {
+        (Use::Nothing, _) => 0,
+        (Use::Install, Target::Pool(pool)) => pool.install(|| 0),
+        (Use::Install, Target::Current) => rayon_core::scope(|_| 0),
+        (Use::Join(us), Target::Pool(pool)) => {
+            pool.install(|| rayon_core::join(sleep(us), sleep(us)));
             0
         }
-        Use::Broadcast => {
+        (Use::Join(us), Target::Current) => {
+            rayon_core::join(sleep(us), sleep(us));
+            0
+        }
+        (Use::Broadcast, Target::Pool(pool)) => {
             pool.broadcast(|_| ());
             0
         }
-        Use::Nested { len, window, take } => {
+        (Use::Broadcast, Target::Current) => {
+            rayon_core::broadcast(|_| ());
+            0
+        }
+        (Use::Nested { len, window, take }, target) => {
             let nested = in_order(0..len).window(window);
-            let nested = match caller {
-                Caller::Outside => nested.pool(pool),
-                // The current pool, which is this one.
-                Caller::Inside => nested,
+            let nested = match target {
+                Target::Pool(pool) => nested.pool(pool),
+                Target::Current => nested,
             };
             nested
-                .map(|i| i)
+                .map_init(|| Ok(String::from("state")), |state, i| i + state.len() - 5)
                 .with_iter(|results| Ok::<_, String>(results.take(take.unwrap_or(len)).sum()))
                 .or_unwind()
                 .unwrap()
@@ -130,7 +202,7 @@ fn use_pool(pool: &ThreadPool, caller: Caller, what: Use) -> usize {
     }
 }
 
-/// What a nested use returns, by the same rules.
+/// What a use returns, by the same rules.
 fn expected(what: Use) -> usize {
     match what {
         Use::Nested { len, take, .. } => (0..take.unwrap_or(len).min(len)).sum(),
@@ -158,7 +230,10 @@ impl Drop for State<'_> {
 #[derive(Default)]
 struct Record {
     inits: AtomicUsize,
+    /// States built, by thread.
+    built: Mutex<HashMap<ThreadId, usize>>,
     live: AtomicIsize,
+    init_failed: AtomicBool,
     broken: Mutex<Vec<String>>,
 }
 
@@ -168,67 +243,83 @@ impl Record {
     }
 }
 
+type Consumed = (usize, usize, usize, usize);
+
 struct Outcome {
     result: Result<Result<(), String>, Panic>,
-    /// For each consumed item, its index and the values its uses returned.
-    consumed: Vec<(usize, usize, usize)>,
+    /// For each consumed item, its index and what its uses returned.
+    consumed: Vec<Consumed>,
     /// How many states were alive when the call returned.
     live_after: isize,
     record: Record,
 }
 
 fn run(scenario: &Scenario) -> Outcome {
-    let Scenario { threads, window, caller, items } = scenario;
+    let Scenario { threads, window, caller, items, failure } = scenario;
     let pool = pool(*threads);
+    let target = match caller {
+        Caller::Global => Target::Current,
+        _ => Target::Pool(&pool),
+    };
     let record = Record::default();
     let mut consumed = Vec::new();
     let mut call = || {
-        let map = in_order(items.iter().enumerate()).window(*window);
+        let items = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (index, item, use_pool(target, item.by_items)));
+        let map = in_order(items).window(*window);
         let map = match caller {
-            Caller::Outside => map.pool(&pool),
-            Caller::Inside => map,
+            Caller::Outside | Caller::OtherPool(_) => map.pool(&pool),
+            Caller::Inside | Caller::Global => map,
         };
         map.map_init(
             || {
-                record.inits.fetch_add(1, Ordering::SeqCst);
+                let nth = record.inits.fetch_add(1, Ordering::SeqCst);
+                if matches!(failure, Some(Failure::InitFails(n)) if *n == nth) {
+                    record.init_failed.store(true, Ordering::SeqCst);
+                    return Err("init failed".to_owned());
+                }
+                let mut built = record.built.lock().unwrap();
+                *built.entry(thread::current().id()).or_default() += 1;
                 record.live.fetch_add(1, Ordering::SeqCst);
-                Ok(State {
-                    built_on: thread::current().id(),
-                    in_use: Cell::new(false),
-                    record: &record,
-                })
+                let built_on = thread::current().id();
+                Ok(State { built_on, in_use: Cell::new(false), record: &record })
             },
-            |state, (index, &(work_us, work, _))| {
+            |state, (index, item, by_items): (usize, &Item, usize)| {
                 if state.built_on != thread::current().id() {
                     record.broke(format!("the state for item {index} moved threads"));
                 }
                 if state.in_use.replace(true) {
                     record.broke(format!("the state for item {index} was already in use"));
                 }
-                thread::sleep(Duration::from_micros(work_us));
-                // On a pool thread, so the current pool is this one.
-                let used = use_pool(&pool, Caller::Inside, work);
+                thread::sleep(Duration::from_micros(item.work_us));
+                if matches!(failure, Some(Failure::WorkPanics(k)) if *k == index) {
+                    state.in_use.set(false);
+                    panic!("work panicked");
+                }
+                let by_work = use_pool(target, item.by_work);
                 state.in_use.set(false);
-                (index, used)
+                (index, by_items, by_work, item.by_consumer)
             },
         )
-        .try_for_each(|(index, worked)| {
-            let consume = items.get(index).map_or(Use::Nothing, |&(_, _, consume)| consume);
-            consumed.push((index, worked, use_pool(&pool, *caller, consume)));
+        .with_iter(|results| {
+            for (index, by_items, by_work, by_consumer) in results {
+                if matches!(failure, Some(Failure::Stops(k)) if *k == consumed.len()) {
+                    break;
+                }
+                consumed.push((index, by_items, by_work, use_pool(target, by_consumer)));
+            }
             Ok(())
         })
     };
     let result = match caller {
-        Caller::Outside => call(),
+        Caller::Outside | Caller::Global => call(),
         Caller::Inside => pool.install(call),
+        Caller::OtherPool(threads) => self::pool(*threads).install(call),
     };
     let live_after = record.live.load(Ordering::SeqCst);
     Outcome { result, consumed, live_after, record }
-}
-
-fn run_with_deadline(scenario: &Scenario) -> Outcome {
-    let scenario = scenario.clone();
-    with_deadline(move || run(&scenario))
 }
 
 /// Runs `f` on its own thread: its result, its panic resumed here, or a
@@ -246,31 +337,77 @@ fn with_deadline<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T
     }
 }
 
-/// Every item's results, in order, with what its uses returned.
-fn assert_all_consumed(scenario: &Scenario, outcome: &Outcome) {
-    let expected: Vec<_> = scenario
+fn run_with_deadline(scenario: &Scenario) -> Outcome {
+    let scenario = scenario.clone();
+    with_deadline(move || run(&scenario))
+}
+
+/// What the first `n` items should have returned.
+fn expected_prefix(scenario: &Scenario, n: usize) -> Vec<Consumed> {
+    scenario
         .items
         .iter()
+        .take(n)
         .enumerate()
-        .map(|(index, &(_, work, consume))| (index, expected(work), expected(consume)))
-        .collect();
-    assert_eq!(outcome.consumed, expected);
+        .map(|(index, item)| {
+            (index, expected(item.by_items), expected(item.by_work), expected(item.by_consumer))
+        })
+        .collect()
+}
+
+/// Every item's result, in order, with what its uses returned.
+fn assert_all_consumed(scenario: &Scenario, outcome: &Outcome) {
+    assert!(matches!(outcome.result, Ok(Ok(()))), "{:?}", outcome.result);
+    assert_eq!(outcome.consumed, expected_prefix(scenario, scenario.items.len()));
 }
 
 #[hegel::test]
 fn the_consumer_can_use_the_pool(tc: TestCase) {
-    let scenario = tc.draw(scenario(false, true).print_as_debug());
-    let outcome = run_with_deadline(&scenario);
-    assert!(matches!(outcome.result, Ok(Ok(()))), "{:?}", outcome.result);
-    assert_all_consumed(&scenario, &outcome);
+    let users = Users { consumer: true, ..NONE };
+    let scenario = tc.draw(scenario(users, false).print_as_debug());
+    assert_all_consumed(&scenario, &run_with_deadline(&scenario));
 }
 
 #[hegel::test]
 fn the_work_can_use_the_pool(tc: TestCase) {
-    let scenario = tc.draw(scenario(true, false).print_as_debug());
+    let users = Users { work: true, ..NONE };
+    let scenario = tc.draw(scenario(users, false).print_as_debug());
+    assert_all_consumed(&scenario, &run_with_deadline(&scenario));
+}
+
+#[hegel::test]
+fn the_items_can_use_the_pool(tc: TestCase) {
+    let users = Users { items: true, ..NONE };
+    let scenario = tc.draw(scenario(users, false).print_as_debug());
+    assert_all_consumed(&scenario, &run_with_deadline(&scenario));
+}
+
+/// A failure stops the map as documented, with the pool in use all around.
+#[hegel::test]
+fn a_failure_stops_the_map_while_the_pool_is_shared(tc: TestCase) {
+    let scenario = tc.draw(scenario(ALL, true).print_as_debug());
     let outcome = run_with_deadline(&scenario);
-    assert!(matches!(outcome.result, Ok(Ok(()))), "{:?}", outcome.result);
-    assert_all_consumed(&scenario, &outcome);
+    let len = scenario.items.len();
+    match scenario.failure {
+        None => assert_all_consumed(&scenario, &outcome),
+        Some(Failure::WorkPanics(k)) => {
+            let message = outcome.result.as_ref().unwrap_err().to_string();
+            assert_eq!(message, "A worker panicked: work panicked");
+            assert_eq!(outcome.consumed, expected_prefix(&scenario, k));
+        }
+        Some(Failure::InitFails(_)) if outcome.record.init_failed.load(Ordering::SeqCst) => {
+            assert_eq!(outcome.result.as_ref().unwrap(), &Err("init failed".to_owned()));
+            let n = outcome.consumed.len();
+            assert!(n < len, "the item whose `init` failed was consumed");
+            assert_eq!(outcome.consumed, expected_prefix(&scenario, n));
+        }
+        // The failing call never came: fewer threads got an item.
+        Some(Failure::InitFails(_)) => assert_all_consumed(&scenario, &outcome),
+        Some(Failure::Stops(k)) => {
+            assert!(matches!(outcome.result, Ok(Ok(()))), "{:?}", outcome.result);
+            assert_eq!(outcome.consumed, expected_prefix(&scenario, k));
+        }
+    }
 }
 
 /// `init`'s state need not be `Send`, so it must stay on its thread, and
@@ -278,23 +415,24 @@ fn the_work_can_use_the_pool(tc: TestCase) {
 /// call returns.
 #[hegel::test]
 fn a_state_stays_on_its_thread_while_the_pool_is_shared(tc: TestCase) {
-    let scenario = tc.draw(scenario(true, true).print_as_debug());
+    let scenario = tc.draw(scenario(ALL, true).print_as_debug());
     let outcome = run_with_deadline(&scenario);
     assert_eq!(outcome.record.broken.into_inner().unwrap(), Vec::<String>::new());
-    assert!(outcome.record.inits.into_inner() <= scenario.threads, "`init` ran twice on a thread");
+    let built = outcome.record.built.into_inner().unwrap();
+    assert!(built.values().all(|&n| n == 1), "`init` ran twice on a thread: {built:?}");
     assert_eq!(outcome.live_after, 0, "states outlived the call");
 }
 
 /// Two maps chained on one pool, the second taking the first's results as
-/// its items: the second's workers wait in the first's iterator, on the
-/// threads the first's workers need.
+/// its items, while each one's work uses the pool too.
 #[derive(Debug, Clone)]
 struct Stages {
     threads: usize,
     windows: (usize, usize),
     caller: Caller,
-    /// How long each item takes in the first stage and in the second.
-    items: Vec<(u64, u64)>,
+    /// For each item, how long it takes and what it does with the pool, in
+    /// the first stage and in the second.
+    items: Vec<((u64, Use), (u64, Use))>,
 }
 
 #[hegel::composite]
@@ -302,10 +440,9 @@ fn stages(tc: &TestCase) -> Stages {
     let threads = tc.draw_silent(gs::integers::<usize>().min_value(1).max_value(6));
     let window = || tc.draw_silent(gs::integers::<usize>().min_value(1).max_value(8));
     let windows = (window(), window());
-    let caller = if tc.draw_silent(gs::booleans()) { Caller::Inside } else { Caller::Outside };
-    let items = (0..tc.draw_silent(below(60)))
-        .map(|_| (tc.draw_silent(latency()), tc.draw_silent(latency())))
-        .collect();
+    let caller = tc.draw_silent(caller());
+    let stage = || (tc.draw_silent(latency()), tc.draw_silent(pool_use()));
+    let items = (0..tc.draw_silent(below(40))).map(|_| (stage(), stage())).collect();
     Stages { threads, windows, caller, items }
 }
 
@@ -315,37 +452,43 @@ fn stages_can_share_a_pool(tc: TestCase) {
     let Stages { threads, windows: (first, second), caller, items } = stages.clone();
     let result = with_deadline(move || {
         let pool = pool(threads);
+        let target = match caller {
+            Caller::Global => Target::Current,
+            _ => Target::Pool(&pool),
+        };
+        let work = |(us, what): (u64, Use)| {
+            thread::sleep(Duration::from_micros(us));
+            use_pool(target, what)
+        };
         let run = || {
-            let first = in_order(items.iter().enumerate()).window(first);
-            let first = match caller {
-                Caller::Outside => first.pool(&pool),
-                Caller::Inside => first,
+            let firsts = in_order(items.iter().enumerate()).window(first);
+            let firsts = match caller {
+                Caller::Outside | Caller::OtherPool(_) => firsts.pool(&pool),
+                Caller::Inside | Caller::Global => firsts,
             };
-            first
-                .map(|(index, &(us, next_us))| {
-                    thread::sleep(Duration::from_micros(us));
-                    (index, next_us)
-                })
-                .with_iter(|firsts| {
-                    let second = in_order(firsts).window(second);
-                    let second = match caller {
-                        Caller::Outside => second.pool(&pool),
-                        Caller::Inside => second,
-                    };
-                    second
-                        .map(|(index, us)| {
-                            thread::sleep(Duration::from_micros(us));
-                            index
-                        })
-                        .with_iter(|seconds| Ok::<_, String>(seconds.collect::<Vec<_>>()))
-                        .or_unwind()
-                })
+            firsts.map(|(index, &(stage, next))| (index, work(stage), next)).with_iter(|firsts| {
+                let seconds = in_order(firsts).window(second);
+                let seconds = match caller {
+                    Caller::Outside | Caller::OtherPool(_) => seconds.pool(&pool),
+                    Caller::Inside | Caller::Global => seconds,
+                };
+                seconds
+                    .map(|(index, first, stage)| (index, first, work(stage)))
+                    .with_iter(|seconds| Ok::<_, String>(seconds.collect::<Vec<_>>()))
+                    .or_unwind()
+            })
         };
         match caller {
-            Caller::Outside => run(),
+            Caller::Outside | Caller::Global => run(),
             Caller::Inside => pool.install(run),
+            Caller::OtherPool(threads) => self::pool(threads).install(run),
         }
     });
-    let consumed = result.unwrap().unwrap();
-    assert_eq!(consumed, (0..stages.items.len()).collect::<Vec<_>>());
+    let expected: Vec<_> = stages
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, &((_, first), (_, second)))| (index, expected(first), expected(second)))
+        .collect();
+    assert_eq!(result.unwrap().unwrap(), expected);
 }
