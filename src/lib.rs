@@ -314,16 +314,16 @@ impl<I, Init, Work> InOrder<'_, I, Init, Work> {
             consumed
         });
 
-        let consumed = consumed.map_err(|payload| Panic::new(payload, true))?;
+        let consumed = consumed.map_err(|payload| Panic::new(payload, PanicOrigin::Consumer))?;
         if let Some(payload) = worker_panic.into_inner().unwrap_or_else(PoisonError::into_inner) {
-            return Err(Panic::new(payload, false));
+            return Err(Panic::new(payload, PanicOrigin::Worker));
         }
         match (consumed, init_failure.into_inner().unwrap_or_else(PoisonError::into_inner)) {
             (Ok(()), None) => Ok(Ok(())),
             (Err(Some(consumer)), _) => Ok(Err(consumer)),
             (Ok(()) | Err(None), Some(init)) => Ok(Err(init)),
             // Only a failed worker leaves a result unsent, and it recorded why.
-            (Err(None), None) => Err(Panic::new(Box::new(LOST_RESULT), false)),
+            (Err(None), None) => Err(Panic::new(Box::new(LOST_RESULT), PanicOrigin::LostResult)),
         }
     }
 }
@@ -380,12 +380,31 @@ fn keep_first<T>(first: &Mutex<Option<T>>, failure: T) {
 /// too, with a message saying so.
 pub struct Panic {
     payload: Mutex<Box<dyn Any + Send>>,
-    in_consumer: bool,
+    origin: PanicOrigin,
+}
+
+/// Where a [`Panic`] comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PanicOrigin {
+    /// A worker panicked, in `init` or in the work
+    Worker,
+    /// `consume` panicked
+    Consumer,
+    /// Nothing panicked, so no panic hook ran: a result went missing although
+    /// no worker failed, which is a bug in ordair
+    LostResult,
 }
 
 impl Panic {
-    fn new(payload: Box<dyn Any + Send>, in_consumer: bool) -> Self {
-        Self { payload: Mutex::new(payload), in_consumer }
+    fn new(payload: Box<dyn Any + Send>, origin: PanicOrigin) -> Self {
+        Self { payload: Mutex::new(payload), origin }
+    }
+
+    /// Where it comes from, e.g. to describe it without repeating the message
+    /// that the panic hook already printed.
+    pub fn origin(&self) -> PanicOrigin {
+        self.origin
     }
 
     /// The payload, as `std::panic::catch_unwind` gives it.
@@ -417,10 +436,11 @@ impl<T> OrUnwind<T> for Result<T, Panic> {
 impl fmt::Display for Panic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let payload = self.payload.lock().unwrap_or_else(PoisonError::into_inner);
-        match message(&**payload) {
-            LOST_RESULT => f.write_str(LOST_RESULT),
-            message if self.in_consumer => write!(f, "The consumer panicked: {message}"),
-            message => write!(f, "A worker panicked: {message}"),
+        let message = message(&**payload);
+        match self.origin {
+            PanicOrigin::Worker => write!(f, "A worker panicked: {message}"),
+            PanicOrigin::Consumer => write!(f, "The consumer panicked: {message}"),
+            PanicOrigin::LostResult => f.write_str(message),
         }
     }
 }
@@ -429,7 +449,7 @@ impl fmt::Debug for Panic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let payload = self.payload.lock().unwrap_or_else(PoisonError::into_inner);
         f.debug_struct("Panic")
-            .field("in_consumer", &self.in_consumer)
+            .field("origin", &self.origin)
             .field("message", &message(&**payload))
             .finish()
     }

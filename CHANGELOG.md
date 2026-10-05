@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `Panic::origin()` says whether a worker or `consume` panicked, or whether a
+  result went missing, which is a bug in ordair and no panic at all. Before,
+  that was only in the `Display` text, next to the panic message, so a caller
+  that already showed the message (e.g. from its panic hook) could not say
+  what happened without repeating it.
+
 ## 0.3.0
 
 Breaking: the outer error is now `Panic` instead of `WorkerPanic`, and it is

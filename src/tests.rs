@@ -1,4 +1,4 @@
-use crate::{OrUnwind, Panic, in_order};
+use crate::{OrUnwind, Panic, PanicOrigin, in_order};
 use rayon_core::ThreadPool;
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
@@ -185,7 +185,9 @@ fn a_panicking_worker_is_the_outer_error_not_a_gap() {
             consumed.push(i);
             Ok::<_, String>(())
         });
-    assert!(result.unwrap_err().to_string().contains("boom"));
+    let panic = result.unwrap_err();
+    assert_eq!(panic.origin(), PanicOrigin::Worker);
+    assert!(panic.to_string().contains("boom"));
     assert_eq!(consumed, (0..30).collect::<Vec<_>>());
 }
 
@@ -197,7 +199,9 @@ fn a_panicking_consumer_is_the_outer_error() {
         consumed += 1;
         Ok::<_, String>(())
     });
-    let message = result.unwrap_err().to_string();
+    let panic = result.unwrap_err();
+    assert_eq!(panic.origin(), PanicOrigin::Consumer);
+    let message = panic.to_string();
     assert!(
         message.starts_with("The consumer panicked: ") && message.contains("boom"),
         "{message}"
