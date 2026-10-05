@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
 
 - `Panic::origin()` says whether a worker or `consume` panicked, or whether a
   result went missing, which is a bug in ordair and no panic at all. Before,
