@@ -15,7 +15,7 @@ rayon-core = "1.13"
 [dev-dependencies]
 anyhow = "1"
 color-eyre = "0.6"
-hegeltest = "0.48.1"
+hegeltest = "0.50.3"
 tracing = "0.1"
 tracing-error = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
